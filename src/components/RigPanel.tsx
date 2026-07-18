@@ -1,0 +1,314 @@
+import { useEffect, useRef, useState } from "react";
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import {
+  type GarmentKind,
+  bindGarment,
+  collectMeshes,
+  exportGlb,
+  findBodyMesh,
+  fitFrame,
+  loadGltf,
+} from "../lib/rig";
+
+interface Props {
+  garmentUrl: string;
+}
+
+type Phase = "closed" | "loading" | "fitting" | "bound";
+
+interface Bag {
+  renderer: THREE.WebGLRenderer;
+  scene: THREE.Scene;
+  controls: OrbitControls;
+  bodyRoot: THREE.Object3D;
+  bodyMesh: THREE.SkinnedMesh;
+  bodyHeight: number;
+  clips: THREE.AnimationClip[];
+  garmentGroup: THREE.Group;
+  garmentSize: number;
+  rigged: THREE.SkinnedMesh[];
+  mixer: THREE.AnimationMixer | null;
+  raf: number;
+}
+
+export function RigPanel({ garmentUrl }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const bagRef = useRef<Bag | null>(null);
+
+  const [phase, setPhase] = useState<Phase>("closed");
+  const [kind, setKind] = useState<GarmentKind>("top");
+  const [scaleMult, setScaleMult] = useState(1);
+  const [offY, setOffY] = useState(0);
+  const [offZ, setOffZ] = useState(0);
+  const [rotY, setRotY] = useState(0);
+  const [pose, setPose] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  // Build the scene once the dressing room is opened.
+  useEffect(() => {
+    if (phase !== "loading") return;
+    let disposed = false;
+    (async () => {
+      try {
+        const [bodyGltf, garmentGltf] = await Promise.all([
+          loadGltf("/body.glb"),
+          loadGltf(garmentUrl),
+        ]);
+        if (disposed || !containerRef.current) return;
+
+        const container = containerRef.current;
+        const width = container.clientWidth || 600;
+        const height = 380;
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        scene.add(new THREE.HemisphereLight(0xffffff, 0x333344, 2.4));
+        const dir = new THREE.DirectionalLight(0xffffff, 2);
+        dir.position.set(2, 3, 2);
+        scene.add(dir);
+
+        const bodyRoot = bodyGltf.scene;
+        scene.add(bodyRoot);
+        bodyRoot.updateMatrixWorld(true);
+        const bodyMesh = findBodyMesh(bodyRoot);
+        const bbox = new THREE.Box3().setFromObject(bodyRoot);
+        const center = bbox.getCenter(new THREE.Vector3());
+        const bodyHeight = bbox.getSize(new THREE.Vector3()).y;
+
+        const camera = new THREE.PerspectiveCamera(40, width / height, bodyHeight / 100, bodyHeight * 20);
+        camera.position.set(center.x, center.y + bodyHeight * 0.1, center.z + bodyHeight * 1.8);
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.copy(center);
+
+        // Center the garment inside a group so fitting is scale + position only.
+        const gScene = garmentGltf.scene;
+        const gBox = new THREE.Box3().setFromObject(gScene);
+        const gCenter = gBox.getCenter(new THREE.Vector3());
+        const garmentSize = Math.max(gBox.getSize(new THREE.Vector3()).y, 1e-6);
+        gScene.position.sub(gCenter);
+        const garmentGroup = new THREE.Group();
+        garmentGroup.add(gScene);
+        scene.add(garmentGroup);
+
+        const bag: Bag = {
+          renderer,
+          scene,
+          controls,
+          bodyRoot,
+          bodyMesh,
+          bodyHeight,
+          clips: bodyGltf.animations,
+          garmentGroup,
+          garmentSize,
+          rigged: [],
+          mixer: null,
+          raf: 0,
+        };
+        bagRef.current = bag;
+
+        const clock = new THREE.Clock();
+        const loop = () => {
+          bag.raf = requestAnimationFrame(loop);
+          bag.mixer?.update(clock.getDelta());
+          controls.update();
+          renderer.render(scene, camera);
+        };
+        loop();
+        setPhase("fitting");
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        setPhase("closed");
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [phase, garmentUrl]);
+
+  // Re-apply the fit whenever kind or a slider changes.
+  useEffect(() => {
+    const bag = bagRef.current;
+    if (!bag || phase !== "fitting") return;
+    const frame = fitFrame(bag.bodyRoot, kind);
+    bag.garmentGroup.scale.setScalar((frame.height / bag.garmentSize) * scaleMult);
+    bag.garmentGroup.position.set(
+      frame.center.x,
+      frame.center.y + offY * bag.bodyHeight * 0.25,
+      frame.center.z + offZ * bag.bodyHeight * 0.25,
+    );
+    bag.garmentGroup.rotation.y = (rotY * Math.PI) / 180;
+  }, [phase, kind, scaleMult, offY, offZ, rotY]);
+
+  // Dispose the renderer on unmount.
+  useEffect(
+    () => () => {
+      const bag = bagRef.current;
+      if (bag) {
+        cancelAnimationFrame(bag.raf);
+        bag.renderer.dispose();
+        bag.renderer.domElement.remove();
+      }
+    },
+    [],
+  );
+
+  function stopPose(bag: Bag) {
+    bag.mixer?.stopAllAction();
+    bag.bodyMesh.skeleton.pose();
+  }
+
+  function bind() {
+    const bag = bagRef.current;
+    if (!bag) return;
+    setError(null);
+    try {
+      const meshes = collectMeshes(bag.garmentGroup);
+      if (meshes.length === 0) throw new Error("garment has no meshes");
+      bag.rigged = meshes.map((m) => bindGarment(m, bag.bodyMesh, kind));
+      bag.scene.remove(bag.garmentGroup);
+      setPhase("bound");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function refit() {
+    const bag = bagRef.current;
+    if (!bag) return;
+    stopPose(bag);
+    setPose("");
+    bag.rigged.forEach((m) => m.parent?.remove(m));
+    bag.rigged = [];
+    bag.scene.add(bag.garmentGroup);
+    setPhase("fitting");
+  }
+
+  function selectPose(name: string) {
+    const bag = bagRef.current;
+    if (!bag) return;
+    setPose(name);
+    if (!name) {
+      stopPose(bag);
+      return;
+    }
+    bag.mixer ??= new THREE.AnimationMixer(bag.bodyRoot);
+    bag.mixer.stopAllAction();
+    const clip = bag.clips.find((c) => c.name === name);
+    if (clip) bag.mixer.clipAction(clip).reset().play();
+  }
+
+  async function download(dressed: boolean) {
+    const bag = bagRef.current;
+    if (!bag) return;
+    setError(null);
+    setPose("");
+    stopPose(bag);
+    // For a garment-only export, temporarily detach the body's own meshes so
+    // the file keeps just the skeleton + rigged garment.
+    const detached: Array<[THREE.Object3D, THREE.Object3D]> = [];
+    if (!dressed) {
+      const bodySkins: THREE.SkinnedMesh[] = [];
+      bag.bodyRoot.traverse((o) => {
+        if (o instanceof THREE.SkinnedMesh && !bag.rigged.includes(o)) bodySkins.push(o);
+      });
+      bodySkins.forEach((m) => {
+        detached.push([m, m.parent!]);
+        m.parent!.remove(m);
+      });
+    }
+    try {
+      const blob = await exportGlb(bag.bodyRoot, bag.clips);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = dressed ? "avatar-dressed.glb" : `${kind}-rigged.glb`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      detached.forEach(([m, parent]) => parent.add(m));
+    }
+  }
+
+  if (phase === "closed") {
+    return (
+      <div className="rig-panel">
+        <button onClick={() => setPhase("loading")}>Open dressing room</button>
+        {error && <p className="error">{error}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rig-panel">
+      <div className="row">
+        <label>
+          garment
+          <select
+            value={kind}
+            disabled={phase === "bound"}
+            onChange={(e) => setKind(e.target.value as GarmentKind)}
+          >
+            <option value="top">top (upper body)</option>
+            <option value="bottom">bottom (lower body)</option>
+          </select>
+        </label>
+        {phase === "fitting" && (
+          <button className="primary" onClick={bind}>
+            Bind to skeleton
+          </button>
+        )}
+        {phase === "bound" && (
+          <>
+            <label>
+              pose
+              <select value={pose} onChange={(e) => selectPose(e.target.value)}>
+                <option value="">rest</option>
+                {bagRef.current?.clips.map((c) => (
+                  <option key={c.name}>{c.name}</option>
+                ))}
+              </select>
+            </label>
+            <button onClick={refit}>Re-fit</button>
+            <button onClick={() => download(false)}>Garment GLB</button>
+            <button onClick={() => download(true)}>Dressed GLB</button>
+          </>
+        )}
+      </div>
+
+      {phase === "fitting" && (
+        <div className="rig-sliders">
+          <label>
+            scale
+            <input type="range" min={0.4} max={2} step={0.01} value={scaleMult}
+              onChange={(e) => setScaleMult(Number(e.target.value))} />
+          </label>
+          <label>
+            height
+            <input type="range" min={-1} max={1} step={0.01} value={offY}
+              onChange={(e) => setOffY(Number(e.target.value))} />
+          </label>
+          <label>
+            depth
+            <input type="range" min={-1} max={1} step={0.01} value={offZ}
+              onChange={(e) => setOffZ(Number(e.target.value))} />
+          </label>
+          <label>
+            rotate
+            <input type="range" min={0} max={360} step={1} value={rotY}
+              onChange={(e) => setRotY(Number(e.target.value))} />
+          </label>
+        </div>
+      )}
+
+      <div ref={containerRef} className="rig-canvas">
+        {phase === "loading" && <span className="muted">loading avatar + garment…</span>}
+      </div>
+      {error && <p className="error">{error}</p>}
+    </div>
+  );
+}

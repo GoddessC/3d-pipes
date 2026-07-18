@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -n server,web -c blue,magenta \"node --watch server/index.mjs\" \"vite\"",
+    "dev": "concurrently -n server,web -c blue,magenta \"PORT=5174 node --watch server/index.mjs\" \"vite\"",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -13,11 +13,14 @@
     "express": "^4.21.2",
     "multer": "^1.4.5-lts.2",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "three": "^0.183.2",
+    "three-mesh-bvh": "^0.9.12"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/three": "^0.183.0",
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.0",
     "dotenv": "^16.4.7",

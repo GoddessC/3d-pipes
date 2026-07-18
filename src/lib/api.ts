@@ -1,85 +1,68 @@
 export type ViewKey = "front" | "left" | "back" | "right";
 export const VIEW_ORDER: ViewKey[] = ["front", "left", "back", "right"];
 
-export interface TaskOutput {
-  model?: string;
-  base_model?: string;
-  pbr_model?: string;
-  rendered_image?: string;
-}
+// Meshy uses one endpoint per task kind, both for create and poll.
+export type MeshyKind = "image-to-3d" | "multi-image-to-3d";
 
-export interface TaskData {
-  task_id: string;
-  type: string;
-  status: "queued" | "running" | "success" | "failed" | "cancelled" | "banned" | "expired" | "unknown";
+export interface MeshyTask {
+  id: string;
+  status: "PENDING" | "IN_PROGRESS" | "SUCCEEDED" | "FAILED" | "CANCELED";
   progress: number;
-  output: TaskOutput;
-  input?: unknown;
-  create_time?: number;
+  model_urls?: { glb?: string };
+  thumbnail_url?: string;
+  task_error?: { message?: string };
 }
 
-interface TripoEnvelope<T> {
-  code: number;
-  data: T;
-  message?: string;
-  suggestion?: string;
-}
-
-async function unwrap<T>(res: Response): Promise<T> {
-  const json = (await res.json()) as TripoEnvelope<T> & { error?: string };
-  if (!res.ok || (json.code !== undefined && json.code !== 0)) {
+async function meshyJson<T>(res: Response): Promise<T> {
+  const json = (await res.json()) as T & { message?: string; error?: string };
+  if (!res.ok) {
     throw new Error(json.message ?? json.error ?? `request failed (${res.status})`);
   }
-  return json.data;
+  return json;
 }
 
-export async function uploadImage(file: File): Promise<string> {
-  const form = new FormData();
-  form.append("file", file);
-  const data = await unwrap<{ image_token: string }>(
-    await fetch("/api/upload", { method: "POST", body: form }),
-  );
-  return data.image_token;
-}
-
-export async function createTask(payload: Record<string, unknown>): Promise<string> {
-  const data = await unwrap<{ task_id: string }>(
-    await fetch("/api/task", {
+export async function createMeshyTask(kind: MeshyKind, payload: Record<string, unknown>): Promise<string> {
+  const data = await meshyJson<{ result: string }>(
+    await fetch(`/api/meshy/${kind}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
   );
-  return data.task_id;
+  return data.result;
 }
 
-export async function getTask(id: string): Promise<TaskData> {
-  return unwrap<TaskData>(await fetch(`/api/task/${id}`));
+export async function getMeshyTask(kind: MeshyKind, id: string): Promise<MeshyTask> {
+  return meshyJson<MeshyTask>(await fetch(`/api/meshy/${kind}/${id}`));
 }
 
-const DONE_STATUSES = new Set(["success", "failed", "cancelled", "banned", "expired"]);
+const MESHY_DONE_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELED"]);
 
-export async function pollTask(
+export async function pollMeshyTask(
+  kind: MeshyKind,
   id: string,
-  onProgress: (task: TaskData) => void,
+  onProgress: (task: MeshyTask) => void,
   intervalMs = 2500,
-): Promise<TaskData> {
+): Promise<MeshyTask> {
   for (;;) {
-    const task = await getTask(id);
+    const task = await getMeshyTask(kind, id);
     onProgress(task);
-    if (DONE_STATUSES.has(task.status)) return task;
+    if (MESHY_DONE_STATUSES.has(task.status)) return task;
     await new Promise((r) => setTimeout(r, intervalMs));
   }
 }
 
-/** Route a Tripo output URL through the server proxy (CORS + short-lived URLs). */
-export function proxied(url: string): string {
-  return `/api/model?url=${encodeURIComponent(url)}`;
+/** Meshy accepts images inline as base64 data URIs, so no upload round-trip is needed. */
+export function fileToDataUri(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error("could not read file"));
+    reader.readAsDataURL(file);
+  });
 }
 
-export function fileTypeOf(file: File): string {
-  const ext = file.name.split(".").pop()?.toLowerCase();
-  if (ext === "jpg" || ext === "jpeg") return "jpg";
-  if (ext === "webp") return "webp";
-  return "png";
+/** Route a generated-asset URL through the server proxy (CORS + short-lived URLs). */
+export function proxied(url: string): string {
+  return `/api/model?url=${encodeURIComponent(url)}`;
 }

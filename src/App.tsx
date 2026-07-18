@@ -1,17 +1,16 @@
 import { useRef, useState } from "react";
 import {
   VIEW_ORDER,
-  type TaskData,
+  type MeshyKind,
   type ViewKey,
-  createTask,
-  fileTypeOf,
-  pollTask,
+  createMeshyTask,
+  fileToDataUri,
+  pollMeshyTask,
   proxied,
-  uploadImage,
 } from "./lib/api";
 import { Dropzone, type ViewImage } from "./components/Dropzone";
 import { Viewer } from "./components/Viewer";
-import { TweakPanel } from "./components/TweakPanel";
+import { RigPanel } from "./components/RigPanel";
 
 type Images = Record<ViewKey, ViewImage | null>;
 
@@ -22,11 +21,14 @@ interface HistoryEntry {
   posterUrl: string | null;
 }
 
-const MODEL_VERSIONS = ["v2.5-20250123", "v2.0-20240919", "v1.4-20240625"];
+const MESHY_MODELS = ["latest", "meshy-6", "meshy-5"];
+const POSE_MODES = ["t-pose", "a-pose", ""];
 
 export default function App() {
   const [images, setImages] = useState<Images>({ front: null, left: null, back: null, right: null });
-  const [modelVersion, setModelVersion] = useState(MODEL_VERSIONS[0]);
+  const [modelVersion, setModelVersion] = useState(MESHY_MODELS[0]);
+  const [details, setDetails] = useState("");
+  const [poseMode, setPoseMode] = useState(POSE_MODES[0]);
   const [texture, setTexture] = useState(true);
   const [pbr, setPbr] = useState(true);
 
@@ -43,31 +45,40 @@ export default function App() {
 
   const provided = VIEW_ORDER.filter((v) => images[v]);
 
-  async function runTask(payload: Record<string, unknown>) {
+  // ?rigtest loads the avatar itself as the garment so the dressing room can
+  // be exercised without spending generation credits (dev only).
+  const rigTest = import.meta.env.DEV && new URLSearchParams(window.location.search).has("rigtest");
+  const garmentUrl = modelUrl ?? (rigTest ? "/body.glb" : null);
+
+  function publishResult(taskId: string, type: string, url: string, posterRaw: string | null) {
+    rawModelUrl.current = url;
+    const model = proxied(url);
+    const poster = posterRaw ? proxied(posterRaw) : null;
+    setModelUrl(model);
+    setPosterUrl(poster);
+    setLastTaskId(taskId);
+    setHistory((h) => [{ taskId, type, modelUrl: model, posterUrl: poster }, ...h]);
+    setStatus("done");
+  }
+
+  async function runMeshyTask(kind: MeshyKind, payload: Record<string, unknown>) {
     setBusy(true);
     setError(null);
     setProgress(0);
     try {
       setStatus("creating task…");
-      const taskId = await createTask(payload);
+      const taskId = await createMeshyTask(kind, payload);
       setStatus("queued");
-      const task: TaskData = await pollTask(taskId, (t) => {
-        setStatus(t.status);
+      const task = await pollMeshyTask(kind, taskId, (t) => {
+        setStatus(t.status.toLowerCase().replace("_", " "));
         setProgress(t.progress ?? 0);
       });
-      if (task.status !== "success") {
-        throw new Error(`task ${task.status}`);
+      if (task.status !== "SUCCEEDED") {
+        throw new Error(task.task_error?.message ?? `task ${task.status.toLowerCase()}`);
       }
-      const url = task.output.pbr_model ?? task.output.model ?? task.output.base_model ?? null;
+      const url = task.model_urls?.glb ?? null;
       if (!url) throw new Error("task succeeded but returned no model url");
-      rawModelUrl.current = url;
-      const model = proxied(url);
-      const poster = task.output.rendered_image ? proxied(task.output.rendered_image) : null;
-      setModelUrl(model);
-      setPosterUrl(poster);
-      setLastTaskId(taskId);
-      setHistory((h) => [{ taskId, type: String(payload.type), modelUrl: model, posterUrl: poster }, ...h]);
-      setStatus("done");
+      publishResult(taskId, kind, url, task.thumbnail_url ?? null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setStatus(null);
@@ -81,34 +92,21 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      setStatus("uploading images…");
-      const tokens = Object.fromEntries(
-        await Promise.all(
-          provided.map(async (v) => [v, await uploadImage(images[v]!.file)] as const),
-        ),
-      ) as Partial<Record<ViewKey, string>>;
-
-      const fileRef = (v: ViewKey) =>
-        tokens[v] ? { type: fileTypeOf(images[v]!.file), file_token: tokens[v] } : {};
-
-      const payload: Record<string, unknown> =
-        provided.length === 1
-          ? {
-              type: "image_to_model",
-              file: fileRef(provided[0]),
-              model_version: modelVersion,
-              texture,
-              pbr,
-            }
-          : {
-              type: "multiview_to_model",
-              // Tripo expects [front, left, back, right]; missing views are {}.
-              files: (["front", "left", "back", "right"] as ViewKey[]).map(fileRef),
-              model_version: modelVersion,
-              texture,
-              pbr,
-            };
-      await runTask(payload);
+      setStatus("encoding images…");
+      const uris = await Promise.all(provided.map((v) => fileToDataUri(images[v]!.file)));
+      const options: Record<string, unknown> = {
+        ai_model: modelVersion,
+        should_texture: texture,
+        enable_pbr: pbr,
+      };
+      if (details.trim()) options.texture_prompt = details.trim().slice(0, 600);
+      if (provided.length === 1) {
+        // pose_mode is only documented on the single-image endpoint.
+        if (poseMode) options.pose_mode = poseMode;
+        await runMeshyTask("image-to-3d", { image_url: uris[0], ...options });
+      } else {
+        await runMeshyTask("multi-image-to-3d", { image_urls: uris, ...options });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -119,7 +117,7 @@ export default function App() {
     <div className="app">
       <header>
         <h1>3d-pipes</h1>
-        <span className="muted">image → Tripo3D → asset</span>
+        <span className="muted">image → Meshy → asset</span>
       </header>
 
       <main>
@@ -141,8 +139,18 @@ export default function App() {
             <label>
               model
               <select value={modelVersion} onChange={(e) => setModelVersion(e.target.value)}>
-                {MODEL_VERSIONS.map((m) => (
+                {MESHY_MODELS.map((m) => (
                   <option key={m}>{m}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              pose
+              <select value={poseMode} onChange={(e) => setPoseMode(e.target.value)}>
+                {POSE_MODES.map((p) => (
+                  <option key={p} value={p}>
+                    {p || "as-is"}
+                  </option>
                 ))}
               </select>
             </label>
@@ -156,6 +164,16 @@ export default function App() {
             </label>
           </div>
 
+          <h2>Details</h2>
+          <textarea
+            className="text-input details"
+            rows={3}
+            maxLength={600}
+            placeholder="Optional context for the texture — e.g. “oversized denim jacket, brass buttons, distressed wash”"
+            value={details}
+            onChange={(e) => setDetails(e.target.value)}
+          />
+
           <button className="primary generate" disabled={busy || provided.length === 0} onClick={generate}>
             {busy ? "Working…" : provided.length > 1 ? "Generate (multiview)" : "Generate"}
           </button>
@@ -167,9 +185,6 @@ export default function App() {
             </div>
           )}
           {error && <p className="error">{error}</p>}
-
-          <h2>Tweak</h2>
-          <TweakPanel lastTaskId={lastTaskId} busy={busy} onRun={runTask} />
         </section>
 
         <section className="panel output">
@@ -181,6 +196,12 @@ export default function App() {
               </a>
               {lastTaskId && <span className="muted">task {lastTaskId}</span>}
             </div>
+          )}
+          {garmentUrl && (
+            <>
+              <h2>Dressing room</h2>
+              <RigPanel key={garmentUrl} garmentUrl={garmentUrl} />
+            </>
           )}
           {history.length > 1 && (
             <>
