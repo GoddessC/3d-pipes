@@ -9,13 +9,16 @@ import {
   findBodyMesh,
   fitFrame,
   loadGltf,
+  poseArms,
 } from "../lib/rig";
 
 interface Props {
-  garmentUrl: string;
+  /** Proxied URL of the generated item to preview, or null for avatar only. */
+  garmentUrl: string | null;
 }
 
-type Phase = "closed" | "loading" | "fitting" | "bound";
+// "idle" = avatar only, no garment loaded yet.
+type Phase = "loading" | "idle" | "fitting" | "bound";
 
 interface Bag {
   renderer: THREE.WebGLRenderer;
@@ -25,7 +28,7 @@ interface Bag {
   bodyMesh: THREE.SkinnedMesh;
   bodyHeight: number;
   clips: THREE.AnimationClip[];
-  garmentGroup: THREE.Group;
+  garmentGroup: THREE.Group | null;
   garmentSize: number;
   rigged: THREE.SkinnedMesh[];
   mixer: THREE.AnimationMixer | null;
@@ -36,14 +39,16 @@ export function RigPanel({ garmentUrl }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const bagRef = useRef<Bag | null>(null);
 
-  const [phase, setPhase] = useState<Phase>("closed");
+  const [phase, setPhase] = useState<Phase>("loading");
   const [kind, setKind] = useState<GarmentKind>("top");
   const [scaleMult, setScaleMult] = useState(1);
   const [offY, setOffY] = useState(0);
   const [offZ, setOffZ] = useState(0);
   const [rotY, setRotY] = useState(0);
+  const [armDeg, setArmDeg] = useState(0);
   const [pose, setPose] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const armRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
 
   // Build the scene once the dressing room is opened.
   useEffect(() => {
@@ -53,7 +58,7 @@ export function RigPanel({ garmentUrl }: Props) {
       try {
         const [bodyGltf, garmentGltf] = await Promise.all([
           loadGltf("/body.glb"),
-          loadGltf(garmentUrl),
+          garmentUrl ? loadGltf(garmentUrl) : Promise.resolve(null),
         ]);
         if (disposed || !containerRef.current) return;
 
@@ -72,12 +77,31 @@ export function RigPanel({ garmentUrl }: Props) {
         scene.add(dir);
 
         const bodyRoot = bodyGltf.scene;
+        // Tripo/FBX exports often mark the skin material as alpha-blended,
+        // which lets far surfaces (opposite ear/arm) draw through near ones.
+        bodyRoot.traverse((o) => {
+          if (o instanceof THREE.Mesh) {
+            const mats = Array.isArray(o.material) ? o.material : [o.material];
+            for (const m of mats) {
+              m.transparent = false;
+              m.depthWrite = true;
+            }
+          }
+        });
         scene.add(bodyRoot);
         bodyRoot.updateMatrixWorld(true);
         const bodyMesh = findBodyMesh(bodyRoot);
-        const bbox = new THREE.Box3().setFromObject(bodyRoot);
+        // Frame the camera from bone positions: a static-geometry bounding box
+        // is wrong for skinned meshes whose armature carries scale (Mixamo/FBX).
+        const bbox = new THREE.Box3();
+        bodyRoot.traverse((o) => {
+          if ((o as THREE.Bone).isBone) {
+            bbox.expandByPoint(o.getWorldPosition(new THREE.Vector3()));
+          }
+        });
+        if (bbox.isEmpty()) bbox.setFromObject(bodyRoot);
         const center = bbox.getCenter(new THREE.Vector3());
-        const bodyHeight = bbox.getSize(new THREE.Vector3()).y;
+        const bodyHeight = bbox.getSize(new THREE.Vector3()).y * 1.15; // bones sit inside the flesh
 
         const camera = new THREE.PerspectiveCamera(40, width / height, bodyHeight / 100, bodyHeight * 20);
         camera.position.set(center.x, center.y + bodyHeight * 0.1, center.z + bodyHeight * 1.8);
@@ -85,14 +109,18 @@ export function RigPanel({ garmentUrl }: Props) {
         controls.target.copy(center);
 
         // Center the garment inside a group so fitting is scale + position only.
-        const gScene = garmentGltf.scene;
-        const gBox = new THREE.Box3().setFromObject(gScene);
-        const gCenter = gBox.getCenter(new THREE.Vector3());
-        const garmentSize = Math.max(gBox.getSize(new THREE.Vector3()).y, 1e-6);
-        gScene.position.sub(gCenter);
-        const garmentGroup = new THREE.Group();
-        garmentGroup.add(gScene);
-        scene.add(garmentGroup);
+        let garmentGroup: THREE.Group | null = null;
+        let garmentSize = 1;
+        if (garmentGltf) {
+          const gScene = garmentGltf.scene;
+          const gBox = new THREE.Box3().setFromObject(gScene);
+          const gCenter = gBox.getCenter(new THREE.Vector3());
+          garmentSize = Math.max(gBox.getSize(new THREE.Vector3()).y, 1e-6);
+          gScene.position.sub(gCenter);
+          garmentGroup = new THREE.Group();
+          garmentGroup.add(gScene);
+          scene.add(garmentGroup);
+        }
 
         const bag: Bag = {
           renderer,
@@ -109,6 +137,7 @@ export function RigPanel({ garmentUrl }: Props) {
           raf: 0,
         };
         bagRef.current = bag;
+        if (import.meta.env.DEV) (window as unknown as { __rig?: Bag }).__rig = bag;
 
         const clock = new THREE.Clock();
         const loop = () => {
@@ -118,10 +147,10 @@ export function RigPanel({ garmentUrl }: Props) {
           renderer.render(scene, camera);
         };
         loop();
-        setPhase("fitting");
+        setPhase(garmentGroup ? "fitting" : "idle");
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
-        setPhase("closed");
+        setPhase("idle");
       }
     })();
     return () => {
@@ -132,16 +161,28 @@ export function RigPanel({ garmentUrl }: Props) {
   // Re-apply the fit whenever kind or a slider changes.
   useEffect(() => {
     const bag = bagRef.current;
-    if (!bag || phase !== "fitting") return;
-    const frame = fitFrame(bag.bodyRoot, kind);
-    bag.garmentGroup.scale.setScalar((frame.height / bag.garmentSize) * scaleMult);
-    bag.garmentGroup.position.set(
-      frame.center.x,
-      frame.center.y + offY * bag.bodyHeight * 0.25,
-      frame.center.z + offZ * bag.bodyHeight * 0.25,
-    );
-    bag.garmentGroup.rotation.y = (rotY * Math.PI) / 180;
+    if (!bag?.garmentGroup || phase !== "fitting") return;
+    try {
+      const frame = fitFrame(bag.bodyRoot, kind);
+      bag.garmentGroup.scale.setScalar((frame.height / bag.garmentSize) * scaleMult);
+      bag.garmentGroup.position.set(
+        frame.center.x,
+        frame.center.y + offY * bag.bodyHeight * 0.25,
+        frame.center.z + offZ * bag.bodyHeight * 0.25,
+      );
+      bag.garmentGroup.rotation.y = (rotY * Math.PI) / 180;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }, [phase, kind, scaleMult, offY, offZ, rotY]);
+
+  // Pose the avatar's arms to line up with the garment's sleeves.
+  useEffect(() => {
+    const bag = bagRef.current;
+    if (!bag || phase !== "fitting") return;
+    poseArms(bag.bodyMesh, armRest.current, armDeg);
+    bag.bodyRoot.updateMatrixWorld(true);
+  }, [phase, armDeg]);
 
   // Dispose the renderer on unmount.
   useEffect(
@@ -163,7 +204,7 @@ export function RigPanel({ garmentUrl }: Props) {
 
   function bind() {
     const bag = bagRef.current;
-    if (!bag) return;
+    if (!bag?.garmentGroup) return;
     setError(null);
     try {
       const meshes = collectMeshes(bag.garmentGroup);
@@ -178,7 +219,7 @@ export function RigPanel({ garmentUrl }: Props) {
 
   function refit() {
     const bag = bagRef.current;
-    if (!bag) return;
+    if (!bag?.garmentGroup) return;
     stopPose(bag);
     setPose("");
     bag.rigged.forEach((m) => m.parent?.remove(m));
@@ -234,17 +275,25 @@ export function RigPanel({ garmentUrl }: Props) {
     }
   }
 
-  if (phase === "closed") {
-    return (
-      <div className="rig-panel">
-        <button onClick={() => setPhase("loading")}>Open dressing room</button>
-        {error && <p className="error">{error}</p>}
-      </div>
-    );
-  }
-
   return (
     <div className="rig-panel">
+      {phase === "idle" && (
+        <p className="muted">Generate an item to preview and rig it on the avatar.</p>
+      )}
+      {phase !== "loading" && (
+        <div className="row">
+          <label>
+            animation
+            <select value={pose} onChange={(e) => selectPose(e.target.value)}>
+              <option value="">rest</option>
+              {bagRef.current?.clips.map((c) => (
+                <option key={c.name}>{c.name}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+      {(phase === "fitting" || phase === "bound") && (
       <div className="row">
         <label>
           garment
@@ -264,21 +313,13 @@ export function RigPanel({ garmentUrl }: Props) {
         )}
         {phase === "bound" && (
           <>
-            <label>
-              pose
-              <select value={pose} onChange={(e) => selectPose(e.target.value)}>
-                <option value="">rest</option>
-                {bagRef.current?.clips.map((c) => (
-                  <option key={c.name}>{c.name}</option>
-                ))}
-              </select>
-            </label>
             <button onClick={refit}>Re-fit</button>
             <button onClick={() => download(false)}>Garment GLB</button>
             <button onClick={() => download(true)}>Dressed GLB</button>
           </>
         )}
       </div>
+      )}
 
       {phase === "fitting" && (
         <div className="rig-sliders">
@@ -302,11 +343,18 @@ export function RigPanel({ garmentUrl }: Props) {
             <input type="range" min={0} max={360} step={1} value={rotY}
               onChange={(e) => setRotY(Number(e.target.value))} />
           </label>
+          <label>
+            arms
+            <input type="range" min={-90} max={90} step={1} value={armDeg}
+              onChange={(e) => setArmDeg(Number(e.target.value))} />
+          </label>
         </div>
       )}
 
       <div ref={containerRef} className="rig-canvas">
-        {phase === "loading" && <span className="muted">loading avatar + garment…</span>}
+        {phase === "loading" && (
+          <span className="muted">{garmentUrl ? "loading avatar + garment…" : "loading avatar…"}</span>
+        )}
       </div>
       {error && <p className="error">{error}</p>}
     </div>

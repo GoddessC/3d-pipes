@@ -197,12 +197,8 @@ export default function App() {
               {lastTaskId && <span className="muted">task {lastTaskId}</span>}
             </div>
           )}
-          {garmentUrl && (
-            <>
-              <h2>Dressing room</h2>
-              <RigPanel key={garmentUrl} garmentUrl={garmentUrl} />
-            </>
-          )}
+          <h2>Dressing room</h2>
+          <RigPanel key={garmentUrl ?? "avatar"} garmentUrl={garmentUrl} />
           {history.length > 1 && (
             <>
               <h2>History</h2>
