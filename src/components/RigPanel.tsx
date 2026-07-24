@@ -334,6 +334,7 @@ export function RigPanel({ garmentUrl }: Props) {
           >
             <option value="top">top (upper body)</option>
             <option value="bottom">bottom (lower body)</option>
+            <option value="head">head (hat/hair)</option>
           </select>
         </label>
         {phase === "fitting" && (

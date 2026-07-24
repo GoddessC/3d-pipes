@@ -3,7 +3,7 @@ import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js"
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { MeshBVH } from "three-mesh-bvh";
 
-export type GarmentKind = "top" | "bottom";
+export type GarmentKind = "top" | "bottom" | "head";
 
 // Bone names vary wildly between rigs (Maya QuickRig "QuickRigCharacter2_LeftUpLeg",
 // Tripo "L_Thigh" / "L_ThighTwist01", Mixamo "mixamorig:LeftUpLeg", …), so bones
@@ -50,11 +50,12 @@ export function boneRole(name: string): BoneRole | null {
 const BONE_SUBSETS: Record<GarmentKind, BoneRole[]> = {
   bottom: ["hips", "upperleg", "lowerleg", "foot", "toe"],
   top: ["hips", "spine", "shoulder", "upperarm", "forearm", "hand", "neck"],
+  head: ["head", "neck"],
 };
 
 // If a garment vertex ends up with no weight on allowed bones (e.g. a top
 // vertex nearest to a leg), it is pinned entirely to this role's first bone.
-const ANCHOR_ROLE: Record<GarmentKind, BoneRole> = { bottom: "hips", top: "spine" };
+const ANCHOR_ROLE: Record<GarmentKind, BoneRole> = { bottom: "hips", top: "spine", head: "head" };
 
 export function allowedBoneIndices(skeleton: THREE.Skeleton, kind: GarmentKind): Set<number> {
   const roles = new Set<BoneRole>(BONE_SUBSETS[kind]);
@@ -123,6 +124,17 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
     }
     throw new Error(`no ${roles.join("/")} bone found in body.glb`);
   };
+
+  if (kind === "head") {
+    const pts = byRole.get("head");
+    if (!pts?.length) throw new Error("no head bone found in body.glb");
+    const center = pts.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(pts.length);
+    // Head span from base to top-end bone; single-bone rigs estimate from the neck.
+    const ys = pts.map((p) => p.y);
+    let span = Math.max(...ys) - Math.min(...ys);
+    if (span < 1e-4) span = Math.abs(center.y - at("neck", "shoulder").y) * 2;
+    return { center, height: span * 1.5 };
+  }
 
   const hips = at("hips");
   if (kind === "bottom") {
