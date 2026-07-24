@@ -368,6 +368,34 @@ export function conformMeshToBody(
 
   // Conform against the posed surface so an arm-posed avatar wraps correctly.
   const posedGeo = posedBodyGeometry(body);
+
+  // Drop hand/finger faces from the target surface so sleeves stop at the
+  // wrist instead of stretching to wrap the fingers.
+  const srcIndex = body.geometry.attributes.skinIndex as THREE.BufferAttribute;
+  const srcWeight = body.geometry.attributes.skinWeight as THREE.BufferAttribute;
+  const handBones = new Set<number>();
+  body.skeleton.bones.forEach((bone, i) => {
+    if (boneRole(bone.name) === "hand") handBones.add(i);
+  });
+  const isHandVert = (vi: number) => {
+    let w = 0;
+    for (let ch = 0; ch < 4; ch++) {
+      if (handBones.has(srcIndex.getComponent(vi, ch))) w += srcWeight.getComponent(vi, ch);
+    }
+    return w > 0.5;
+  };
+  const srcFaceIdx = posedGeo.index;
+  const faceCount = (srcFaceIdx ? srcFaceIdx.count : posedGeo.attributes.position.count) / 3;
+  const kept: number[] = [];
+  for (let f = 0; f < faceCount; f++) {
+    const i0 = srcFaceIdx ? srcFaceIdx.getX(f * 3) : f * 3;
+    const i1 = srcFaceIdx ? srcFaceIdx.getX(f * 3 + 1) : f * 3 + 1;
+    const i2 = srcFaceIdx ? srcFaceIdx.getX(f * 3 + 2) : f * 3 + 2;
+    if (isHandVert(i0) || isHandVert(i1) || isHandVert(i2)) continue;
+    kept.push(i0, i1, i2);
+  }
+  posedGeo.setIndex(kept);
+
   const bvh = new MeshBVH(posedGeo);
   const bodyPos = posedGeo.attributes.position as THREE.BufferAttribute;
   const bodyIndex = posedGeo.index;

@@ -185,9 +185,8 @@ export default function App() {
             </div>
           )}
           {error && <p className="error">{error}</p>}
-        </section>
 
-        <section className="panel output">
+          <h2>Garment</h2>
           <Viewer src={modelUrl} poster={posterUrl} />
           {modelUrl && (
             <div className="row output-actions">
@@ -197,8 +196,6 @@ export default function App() {
               {lastTaskId && <span className="muted">task {lastTaskId}</span>}
             </div>
           )}
-          <h2>Dressing room</h2>
-          <RigPanel key={garmentUrl ?? "avatar"} garmentUrl={garmentUrl} />
           {history.length > 1 && (
             <>
               <h2>History</h2>
@@ -220,6 +217,11 @@ export default function App() {
               </ul>
             </>
           )}
+        </section>
+
+        <section className="panel output">
+          <h2>Dressing room</h2>
+          <RigPanel key={garmentUrl ?? "avatar"} garmentUrl={garmentUrl} />
         </section>
       </main>
     </div>

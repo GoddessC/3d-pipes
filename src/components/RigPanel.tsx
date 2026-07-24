@@ -43,14 +43,13 @@ export function RigPanel({ garmentUrl }: Props) {
 
   const [phase, setPhase] = useState<Phase>("loading");
   const [kind, setKind] = useState<GarmentKind>("top");
-  const [scaleMult, setScaleMult] = useState(1);
+  const [lengthMult, setLengthMult] = useState(1);
+  const [widthMult, setWidthMult] = useState(1);
   const [offX, setOffX] = useState(0);
   const [offY, setOffY] = useState(0);
   const [offZ, setOffZ] = useState(0);
   const [rotY, setRotY] = useState(0);
   const [armDeg, setArmDeg] = useState(0);
-  const [clearancePct, setClearancePct] = useState(0.8);
-  const [hug, setHug] = useState(0.8);
   const [conformed, setConformed] = useState(false);
   const [pose, setPose] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -70,7 +69,7 @@ export function RigPanel({ garmentUrl }: Props) {
 
         const container = containerRef.current;
         const width = container.clientWidth || 600;
-        const height = 380;
+        const height = 640;
         const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
         renderer.setSize(width, height);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -170,7 +169,9 @@ export function RigPanel({ garmentUrl }: Props) {
     if (!bag?.garmentGroup || phase !== "fitting") return;
     try {
       const frame = fitFrame(bag.bodyRoot, kind);
-      bag.garmentGroup.scale.setScalar((frame.height / bag.garmentSize) * scaleMult);
+      const base = frame.height / bag.garmentSize;
+      // length scales the garment vertically, width its girth (side + front-to-back).
+      bag.garmentGroup.scale.set(base * widthMult, base * lengthMult, base * widthMult);
       bag.garmentGroup.position.set(
         frame.center.x + offX * bag.bodyHeight * 0.25,
         frame.center.y + offY * bag.bodyHeight * 0.25,
@@ -180,7 +181,7 @@ export function RigPanel({ garmentUrl }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [phase, kind, scaleMult, offX, offY, offZ, rotY]);
+  }, [phase, kind, lengthMult, widthMult, offX, offY, offZ, rotY]);
 
   // Pose the avatar's arms to line up with the garment's sleeves.
   useEffect(() => {
@@ -228,10 +229,10 @@ export function RigPanel({ garmentUrl }: Props) {
     if (!bag?.garmentGroup) return;
     setError(null);
     try {
-      const clearance = (clearancePct / 100) * bag.bodyHeight;
+      const clearance = 0.008 * bag.bodyHeight;
       const influence = clearance + 0.08 * bag.bodyHeight;
       collectMeshes(bag.garmentGroup).forEach((m) =>
-        conformMeshToBody(m, bag.bodyMesh, clearance, influence, hug),
+        conformMeshToBody(m, bag.bodyMesh, clearance, influence, 0.8),
       );
       setConformed(true);
     } catch (err) {
@@ -357,9 +358,14 @@ export function RigPanel({ garmentUrl }: Props) {
       {phase === "fitting" && (
         <div className="rig-sliders">
           <label>
-            scale
-            <input type="range" min={0.4} max={2} step={0.01} value={scaleMult}
-              onChange={(e) => setScaleMult(Number(e.target.value))} />
+            length
+            <input type="range" min={0.4} max={2} step={0.01} value={lengthMult}
+              onChange={(e) => setLengthMult(Number(e.target.value))} />
+          </label>
+          <label>
+            width
+            <input type="range" min={0.4} max={2} step={0.01} value={widthMult}
+              onChange={(e) => setWidthMult(Number(e.target.value))} />
           </label>
           <label>
             side
@@ -385,16 +391,6 @@ export function RigPanel({ garmentUrl }: Props) {
             arms
             <input type="range" min={-90} max={90} step={1} value={armDeg}
               onChange={(e) => setArmDeg(Number(e.target.value))} />
-          </label>
-          <label>
-            gap
-            <input type="range" min={0.1} max={3} step={0.1} value={clearancePct}
-              onChange={(e) => setClearancePct(Number(e.target.value))} />
-          </label>
-          <label>
-            hug
-            <input type="range" min={0} max={1} step={0.05} value={hug}
-              onChange={(e) => setHug(Number(e.target.value))} />
           </label>
         </div>
       )}
