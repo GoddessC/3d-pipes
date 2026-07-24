@@ -5,11 +5,13 @@ import {
   type GarmentKind,
   bindGarment,
   collectMeshes,
+  conformMeshToBody,
   exportGlb,
   findBodyMesh,
   fitFrame,
   loadGltf,
   poseArms,
+  resetConform,
 } from "../lib/rig";
 
 interface Props {
@@ -42,10 +44,14 @@ export function RigPanel({ garmentUrl }: Props) {
   const [phase, setPhase] = useState<Phase>("loading");
   const [kind, setKind] = useState<GarmentKind>("top");
   const [scaleMult, setScaleMult] = useState(1);
+  const [offX, setOffX] = useState(0);
   const [offY, setOffY] = useState(0);
   const [offZ, setOffZ] = useState(0);
   const [rotY, setRotY] = useState(0);
   const [armDeg, setArmDeg] = useState(0);
+  const [clearancePct, setClearancePct] = useState(0.8);
+  const [hug, setHug] = useState(0.8);
+  const [conformed, setConformed] = useState(false);
   const [pose, setPose] = useState("");
   const [error, setError] = useState<string | null>(null);
   const armRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
@@ -166,7 +172,7 @@ export function RigPanel({ garmentUrl }: Props) {
       const frame = fitFrame(bag.bodyRoot, kind);
       bag.garmentGroup.scale.setScalar((frame.height / bag.garmentSize) * scaleMult);
       bag.garmentGroup.position.set(
-        frame.center.x,
+        frame.center.x + offX * bag.bodyHeight * 0.25,
         frame.center.y + offY * bag.bodyHeight * 0.25,
         frame.center.z + offZ * bag.bodyHeight * 0.25,
       );
@@ -174,7 +180,7 @@ export function RigPanel({ garmentUrl }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [phase, kind, scaleMult, offY, offZ, rotY]);
+  }, [phase, kind, scaleMult, offX, offY, offZ, rotY]);
 
   // Pose the avatar's arms to line up with the garment's sleeves.
   useEffect(() => {
@@ -215,6 +221,29 @@ export function RigPanel({ garmentUrl }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  function conform() {
+    const bag = bagRef.current;
+    if (!bag?.garmentGroup) return;
+    setError(null);
+    try {
+      const clearance = (clearancePct / 100) * bag.bodyHeight;
+      const influence = clearance + 0.08 * bag.bodyHeight;
+      collectMeshes(bag.garmentGroup).forEach((m) =>
+        conformMeshToBody(m, bag.bodyMesh, clearance, influence, hug),
+      );
+      setConformed(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function resetShape() {
+    const bag = bagRef.current;
+    if (!bag?.garmentGroup) return;
+    collectMeshes(bag.garmentGroup).forEach(resetConform);
+    setConformed(false);
   }
 
   function refit() {
@@ -307,9 +336,13 @@ export function RigPanel({ garmentUrl }: Props) {
           </select>
         </label>
         {phase === "fitting" && (
-          <button className="primary" onClick={bind}>
-            Bind to skeleton
-          </button>
+          <>
+            <button onClick={conform}>Conform to body</button>
+            {conformed && <button onClick={resetShape}>Reset shape</button>}
+            <button className="primary" onClick={bind}>
+              Bind to skeleton
+            </button>
+          </>
         )}
         {phase === "bound" && (
           <>
@@ -327,6 +360,11 @@ export function RigPanel({ garmentUrl }: Props) {
             scale
             <input type="range" min={0.4} max={2} step={0.01} value={scaleMult}
               onChange={(e) => setScaleMult(Number(e.target.value))} />
+          </label>
+          <label>
+            side
+            <input type="range" min={-1} max={1} step={0.01} value={offX}
+              onChange={(e) => setOffX(Number(e.target.value))} />
           </label>
           <label>
             height
@@ -347,6 +385,16 @@ export function RigPanel({ garmentUrl }: Props) {
             arms
             <input type="range" min={-90} max={90} step={1} value={armDeg}
               onChange={(e) => setArmDeg(Number(e.target.value))} />
+          </label>
+          <label>
+            gap
+            <input type="range" min={0.1} max={3} step={0.1} value={clearancePct}
+              onChange={(e) => setClearancePct(Number(e.target.value))} />
+          </label>
+          <label>
+            hug
+            <input type="range" min={0} max={1} step={0.05} value={hug}
+              onChange={(e) => setHug(Number(e.target.value))} />
           </label>
         </div>
       )}

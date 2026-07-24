@@ -145,29 +145,35 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
  * `geometry` must already be in the body mesh's local space, aligned with the
  * posed body as currently rendered.
  */
+/**
+ * Body surface in its current pose, in mesh-local space (getVertexPosition
+ * applies bind matrix + bone matrices per vertex for skinned meshes).
+ */
+function posedBodyGeometry(body: THREE.SkinnedMesh): THREE.BufferGeometry {
+  const bodyGeo = body.geometry;
+  body.updateMatrixWorld(true);
+  const count = bodyGeo.attributes.position.count;
+  const posed = new Float32Array(count * 3);
+  const tmp = new THREE.Vector3();
+  for (let i = 0; i < count; i++) {
+    body.getVertexPosition(i, tmp);
+    posed[i * 3] = tmp.x;
+    posed[i * 3 + 1] = tmp.y;
+    posed[i * 3 + 2] = tmp.z;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(posed, 3));
+  geo.setIndex(bodyGeo.index ? bodyGeo.index.clone() : null);
+  return geo;
+}
+
 export function transferWeights(
   geometry: THREE.BufferGeometry,
   body: THREE.SkinnedMesh,
   kind: GarmentKind,
 ): void {
   const bodyGeo = body.geometry;
-  body.updateMatrixWorld(true);
-
-  // Body surface in its current pose, in mesh-local space (getVertexPosition
-  // applies bind matrix + bone matrices per vertex for skinned meshes).
-  const bodyCount = bodyGeo.attributes.position.count;
-  const posed = new Float32Array(bodyCount * 3);
-  const tmp = new THREE.Vector3();
-  for (let i = 0; i < bodyCount; i++) {
-    body.getVertexPosition(i, tmp);
-    posed[i * 3] = tmp.x;
-    posed[i * 3 + 1] = tmp.y;
-    posed[i * 3 + 2] = tmp.z;
-  }
-  const posedGeo = new THREE.BufferGeometry();
-  posedGeo.setAttribute("position", new THREE.BufferAttribute(posed, 3));
-  posedGeo.setIndex(bodyGeo.index ? bodyGeo.index.clone() : null);
-
+  const posedGeo = posedBodyGeometry(body);
   const bvh = new MeshBVH(posedGeo);
   const index = posedGeo.index;
   const srcIndex = bodyGeo.attributes.skinIndex as THREE.BufferAttribute;
@@ -291,6 +297,167 @@ export function poseArms(
     const qLocal = parentQ.clone().invert().multiply(qWorld).multiply(parentQ);
     bone.quaternion.copy(qLocal.multiply(restQ));
   }
+}
+
+/**
+ * Vertex adjacency with seam welding: vertices duplicated along UV seams are
+ * merged by position so smoothing doesn't crack the mesh open.
+ */
+function weldedAdjacency(geo: THREE.BufferGeometry): { rep: Uint32Array; adj: Map<number, Set<number>> } {
+  const pos = geo.attributes.position as THREE.BufferAttribute;
+  const count = pos.count;
+  const rep = new Uint32Array(count);
+  const canon = new Map<string, number>();
+  for (let i = 0; i < count; i++) {
+    const key = `${Math.round(pos.getX(i) * 1e4)},${Math.round(pos.getY(i) * 1e4)},${Math.round(pos.getZ(i) * 1e4)}`;
+    const existing = canon.get(key);
+    if (existing === undefined) {
+      canon.set(key, i);
+      rep[i] = i;
+    } else {
+      rep[i] = existing;
+    }
+  }
+  const adj = new Map<number, Set<number>>();
+  const link = (u: number, v: number) => {
+    const a = rep[u];
+    const b = rep[v];
+    if (a === b) return;
+    (adj.get(a) ?? adj.set(a, new Set()).get(a)!).add(b);
+    (adj.get(b) ?? adj.set(b, new Set()).get(b)!).add(a);
+  };
+  const index = geo.index;
+  const faces = (index ? index.count : count) / 3;
+  for (let f = 0; f < faces; f++) {
+    const i0 = index ? index.getX(f * 3) : f * 3;
+    const i1 = index ? index.getX(f * 3 + 1) : f * 3 + 1;
+    const i2 = index ? index.getX(f * 3 + 2) : f * 3 + 2;
+    link(i0, i1);
+    link(i1, i2);
+    link(i2, i0);
+  }
+  return { rep, adj };
+}
+
+/**
+ * Shrinkwrap a fitted garment mesh onto the body: vertices inside the body are
+ * pushed out to `clearance` above the surface, vertices within `influence` are
+ * pulled toward it (scaled by `strength`), and the resulting displacement field
+ * is smoothed so pockets/collars deform without denting. Distances are in body
+ * space; the original shape is stashed for resetConform.
+ */
+export function conformMeshToBody(
+  mesh: THREE.Mesh,
+  body: THREE.SkinnedMesh,
+  clearance: number,
+  influence: number,
+  strength: number,
+): void {
+  mesh.updateMatrixWorld(true);
+  body.updateMatrixWorld(true);
+  const geo = mesh.geometry;
+  const pos = geo.attributes.position as THREE.BufferAttribute;
+  const count = pos.count;
+
+  if (!geo.userData.origPositions) {
+    geo.userData.origPositions = (pos.array as Float32Array).slice();
+  }
+
+  const toBody = new THREE.Matrix4().copy(body.matrixWorld).invert().multiply(mesh.matrixWorld);
+  const fromBody = new THREE.Matrix4().copy(toBody).invert();
+
+  // Conform against the posed surface so an arm-posed avatar wraps correctly.
+  const posedGeo = posedBodyGeometry(body);
+  const bvh = new MeshBVH(posedGeo);
+  const bodyPos = posedGeo.attributes.position as THREE.BufferAttribute;
+  const bodyIndex = posedGeo.index;
+
+  // Garment vertices in body space, plus their displacement toward the goal.
+  const local = new Float32Array(count * 3);
+  const disp = new Float32Array(count * 3);
+
+  const v = new THREE.Vector3();
+  const target = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const c = new THREE.Vector3();
+  const n = new THREE.Vector3();
+  const dir = new THREE.Vector3();
+  const goal = new THREE.Vector3();
+
+  for (let i = 0; i < count; i++) {
+    v.fromBufferAttribute(pos, i).applyMatrix4(toBody);
+    local[i * 3] = v.x;
+    local[i * 3 + 1] = v.y;
+    local[i * 3 + 2] = v.z;
+
+    bvh.closestPointToPoint(v, target);
+    const f = target.faceIndex * 3;
+    a.fromBufferAttribute(bodyPos, bodyIndex ? bodyIndex.getX(f) : f);
+    b.fromBufferAttribute(bodyPos, bodyIndex ? bodyIndex.getX(f + 1) : f + 1);
+    c.fromBufferAttribute(bodyPos, bodyIndex ? bodyIndex.getX(f + 2) : f + 2);
+    n.copy(b).sub(a).cross(c.sub(a)).normalize();
+
+    dir.copy(v).sub(target.point);
+    const inside = dir.dot(n) < 0;
+    const d = target.distance;
+
+    let w = 0;
+    if (inside) w = 1;
+    else if (d <= influence) {
+      w = strength * (1 - Math.max(0, d - clearance) / Math.max(influence - clearance, 1e-6));
+    }
+    if (w > 0) {
+      goal.copy(n).multiplyScalar(clearance).add(target.point);
+      disp[i * 3] = (goal.x - v.x) * w;
+      disp[i * 3 + 1] = (goal.y - v.y) * w;
+      disp[i * 3 + 2] = (goal.z - v.z) * w;
+    }
+  }
+
+  // Smooth the displacement field over the welded vertex graph.
+  const { rep, adj } = weldedAdjacency(geo);
+  let cur = disp;
+  let next = new Float32Array(count * 3);
+  for (let it = 0; it < 8; it++) {
+    next.set(cur);
+    for (const [i, nbs] of adj) {
+      let sx = 0;
+      let sy = 0;
+      let sz = 0;
+      for (const nb of nbs) {
+        sx += cur[nb * 3];
+        sy += cur[nb * 3 + 1];
+        sz += cur[nb * 3 + 2];
+      }
+      const inv = 0.6 / nbs.size;
+      next[i * 3] = cur[i * 3] * 0.4 + sx * inv;
+      next[i * 3 + 1] = cur[i * 3 + 1] * 0.4 + sy * inv;
+      next[i * 3 + 2] = cur[i * 3 + 2] * 0.4 + sz * inv;
+    }
+    [cur, next] = [next, cur];
+  }
+
+  for (let i = 0; i < count; i++) {
+    const r = rep[i];
+    v.set(local[i * 3] + cur[r * 3], local[i * 3 + 1] + cur[r * 3 + 1], local[i * 3 + 2] + cur[r * 3 + 2]);
+    v.applyMatrix4(fromBody);
+    pos.setXYZ(i, v.x, v.y, v.z);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+  geo.computeBoundingSphere();
+}
+
+/** Restore a mesh's shape from before its first conformMeshToBody call. */
+export function resetConform(mesh: THREE.Mesh): void {
+  const geo = mesh.geometry;
+  const orig = geo.userData.origPositions as Float32Array | undefined;
+  if (!orig) return;
+  (geo.attributes.position.array as Float32Array).set(orig);
+  geo.attributes.position.needsUpdate = true;
+  geo.computeVertexNormals();
+  geo.computeBoundingSphere();
 }
 
 /**
