@@ -45,10 +45,13 @@ export default function App() {
 
   const provided = VIEW_ORDER.filter((v) => images[v]);
 
-  // ?rigtest loads the avatar itself as the garment so the dressing room can
-  // be exercised without spending generation credits (dev only).
-  const rigTest = import.meta.env.DEV && new URLSearchParams(window.location.search).has("rigtest");
-  const garmentUrl = modelUrl ?? (rigTest ? "/body.glb" : null);
+  // ?rigtest loads a local file as the garment so the dressing room can be
+  // exercised without spending generation credits (dev only). Bare ?rigtest
+  // uses the avatar itself; ?rigtest=/hair.glb loads that path from public/.
+  const rigTestParam = import.meta.env.DEV
+    ? new URLSearchParams(window.location.search).get("rigtest")
+    : null;
+  const garmentUrl = modelUrl ?? (rigTestParam !== null ? rigTestParam || "/body.glb" : null);
 
   function publishResult(taskId: string, type: string, url: string, posterRaw: string | null) {
     rawModelUrl.current = url;

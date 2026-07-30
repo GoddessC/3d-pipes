@@ -32,6 +32,7 @@ interface Bag {
   clips: THREE.AnimationClip[];
   garmentGroup: THREE.Group | null;
   garmentSize: number;
+  garmentCenter: THREE.Vector3;
   rigged: THREE.SkinnedMesh[];
   mixer: THREE.AnimationMixer | null;
   raf: number;
@@ -43,6 +44,7 @@ export function RigPanel({ garmentUrl }: Props) {
 
   const [phase, setPhase] = useState<Phase>("loading");
   const [kind, setKind] = useState<GarmentKind>("top");
+  const [fitMode, setFitMode] = useState<"auto" | "authored">("auto");
   const [lengthMult, setLengthMult] = useState(1);
   const [widthMult, setWidthMult] = useState(1);
   const [offX, setOffX] = useState(0);
@@ -116,10 +118,12 @@ export function RigPanel({ garmentUrl }: Props) {
         // Center the garment inside a group so fitting is scale + position only.
         let garmentGroup: THREE.Group | null = null;
         let garmentSize = 1;
+        const garmentCenter = new THREE.Vector3();
         if (garmentGltf) {
           const gScene = garmentGltf.scene;
           const gBox = new THREE.Box3().setFromObject(gScene);
           const gCenter = gBox.getCenter(new THREE.Vector3());
+          garmentCenter.copy(gCenter);
           garmentSize = Math.max(gBox.getSize(new THREE.Vector3()).y, 1e-6);
           gScene.position.sub(gCenter);
           garmentGroup = new THREE.Group();
@@ -137,6 +141,7 @@ export function RigPanel({ garmentUrl }: Props) {
           clips: bodyGltf.animations,
           garmentGroup,
           garmentSize,
+          garmentCenter,
           rigged: [],
           mixer: null,
           raf: 0,
@@ -168,20 +173,22 @@ export function RigPanel({ garmentUrl }: Props) {
     const bag = bagRef.current;
     if (!bag?.garmentGroup || phase !== "fitting") return;
     try {
-      const frame = fitFrame(bag.bodyRoot, kind);
-      const base = frame.height / bag.garmentSize;
+      // "authored" keeps the file's own placement (for assets built in body
+      // space); "auto" scales/centers the garment onto the body region.
+      const anchor = fitMode === "authored" ? bag.garmentCenter : fitFrame(bag.bodyRoot, kind).center;
+      const base = fitMode === "authored" ? 1 : fitFrame(bag.bodyRoot, kind).height / bag.garmentSize;
       // length scales the garment vertically, width its girth (side + front-to-back).
       bag.garmentGroup.scale.set(base * widthMult, base * lengthMult, base * widthMult);
       bag.garmentGroup.position.set(
-        frame.center.x + offX * bag.bodyHeight * 0.25,
-        frame.center.y + offY * bag.bodyHeight * 0.25,
-        frame.center.z + offZ * bag.bodyHeight * 0.25,
+        anchor.x + offX * bag.bodyHeight * 0.25,
+        anchor.y + offY * bag.bodyHeight * 0.25,
+        anchor.z + offZ * bag.bodyHeight * 0.25,
       );
       bag.garmentGroup.rotation.y = (rotY * Math.PI) / 180;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [phase, kind, lengthMult, widthMult, offX, offY, offZ, rotY]);
+  }, [phase, kind, fitMode, lengthMult, widthMult, offX, offY, offZ, rotY]);
 
   // Pose the avatar's arms to line up with the garment's sleeves.
   useEffect(() => {
@@ -335,6 +342,17 @@ export function RigPanel({ garmentUrl }: Props) {
             <option value="top">top (upper body)</option>
             <option value="bottom">bottom (lower body)</option>
             <option value="head">head (hat/hair)</option>
+          </select>
+        </label>
+        <label>
+          placement
+          <select
+            value={fitMode}
+            disabled={phase === "bound"}
+            onChange={(e) => setFitMode(e.target.value as "auto" | "authored")}
+          >
+            <option value="auto">auto-fit</option>
+            <option value="authored">as authored</option>
           </select>
         </label>
         {phase === "fitting" && (
