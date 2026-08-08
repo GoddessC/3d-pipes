@@ -291,23 +291,126 @@ export function poseArms(
   body: THREE.SkinnedMesh,
   restQuats: Map<THREE.Bone, THREE.Quaternion>,
   angleDeg: number,
+  tPose = false,
 ): void {
   const rad = (angleDeg * Math.PI) / 180;
   const zAxis = new THREE.Vector3(0, 0, 1);
   const parentQ = new THREE.Quaternion();
+
+  // Always start from rest: the T-pose touches clavicles and forearms too, and
+  // the non-T-pose path below only rewrites upper arms.
+  resetArms(restQuats);
+
+  const isLeft = (name: string) => {
+    const n = name.toLowerCase();
+    return n.includes("left") || /(^|[^a-z])l[_\-.]/.test(n);
+  };
+  const rest = (bone: THREE.Bone) => {
+    let q = restQuats.get(bone);
+    if (!q) {
+      q = bone.quaternion.clone();
+      restQuats.set(bone, q);
+    }
+    return q;
+  };
+
+  const boneChild = (bone: THREE.Bone) =>
+    bone.children.find((c) => (c as THREE.Bone).isBone) as THREE.Bone | undefined;
+
+  // Rotate a bone so its current direction points along `desired` (world space).
+  const aimBone = (bone: THREE.Bone, desired: THREE.Vector3) => {
+    const child = boneChild(bone);
+    if (!child) return;
+    bone.updateWorldMatrix(true, true);
+    const from = child.getWorldPosition(new THREE.Vector3())
+      .sub(bone.getWorldPosition(new THREE.Vector3()))
+      .normalize();
+    const qWorld = new THREE.Quaternion().setFromUnitVectors(from, desired);
+    bone.parent!.getWorldQuaternion(parentQ);
+    const qLocal = parentQ.clone().invert().multiply(qWorld).multiply(parentQ);
+    bone.quaternion.premultiply(qLocal);
+    bone.updateWorldMatrix(false, true);
+  };
+
+  // Clavicles first: auto-rigs often lean one shoulder back into the torso
+  // (mirrored in X/Y but not Z), which leaves that arm rooted inside the body.
+  // Re-aim both onto a shared, depth-free direction so the joints sit level.
+  if (tPose) {
+    const shoulders: Array<{ bone: THREE.Bone; sign: number; dir: THREE.Vector3 }> = [];
+    for (const bone of body.skeleton.bones) {
+      if (boneRole(bone.name) !== "shoulder" || !boneChild(bone)) continue;
+      bone.quaternion.copy(rest(bone));
+      bone.updateWorldMatrix(true, true);
+      const dir = boneChild(bone)!
+        .getWorldPosition(new THREE.Vector3())
+        .sub(bone.getWorldPosition(new THREE.Vector3()))
+        .normalize();
+      shoulders.push({ bone, sign: isLeft(bone.name) ? 1 : -1, dir });
+    }
+    if (shoulders.length) {
+      // The clavicle roots themselves can also sit at different depths, which
+      // offsets a whole arm chain rigidly; rotation can't fix that, so mirror
+      // the joint positions onto their average.
+      const world = shoulders.map((e) => e.bone.getWorldPosition(new THREE.Vector3()));
+      const mid = world
+        .reduce((s, p, i) => s.add(new THREE.Vector3(Math.abs(p.x) * shoulders[i].sign, p.y, p.z)), new THREE.Vector3())
+        .divideScalar(shoulders.length);
+      const parentInv = new THREE.Matrix4();
+      shoulders.forEach((e, i) => {
+        e.bone.userData.restPos ??= e.bone.position.clone();
+        const target = new THREE.Vector3(Math.abs(mid.x) * e.sign, mid.y, mid.z);
+        parentInv.copy(e.bone.parent!.matrixWorld).invert();
+        e.bone.position.copy(target.applyMatrix4(parentInv));
+        e.bone.updateWorldMatrix(false, true);
+        world[i].copy(target);
+      });
+
+      const spread = shoulders.reduce((s, e) => s + Math.abs(e.dir.x), 0) / shoulders.length;
+      const drop = shoulders.reduce((s, e) => s + e.dir.y, 0) / shoulders.length;
+      for (const e of shoulders) {
+        aimBone(e.bone, new THREE.Vector3(e.sign * spread, drop, 0).normalize());
+      }
+    }
+  }
+
   for (const bone of body.skeleton.bones) {
     if (boneRole(bone.name) !== "upperarm") continue;
-    const lower = bone.name.toLowerCase();
-    const left = lower.includes("left") || /(^|[^a-z])l[_\-.]/.test(lower);
-    let restQ = restQuats.get(bone);
-    if (!restQ) {
-      restQ = bone.quaternion.clone();
-      restQuats.set(bone, restQ);
+    const left = isLeft(bone.name);
+    const restQ = rest(bone);
+
+    if (tPose) {
+      // Straighten the whole chain onto the horizontal axis, then apply the
+      // slider angle on top, so sleeves line up with a T-posed garment.
+      const sign = left ? 1 : -1;
+      const axis = new THREE.Vector3(sign * Math.cos(rad), Math.sin(rad), 0).normalize();
+      bone.quaternion.copy(restQ);
+      bone.updateWorldMatrix(true, true);
+      aimBone(bone, axis);
+      let link = boneChild(bone);
+      while (link) {
+        const role = boneRole(link.name);
+        if (role !== "forearm" && role !== "upperarm") break;
+        // Reset before aiming so repeated calls can't accumulate twist.
+        link.quaternion.copy(rest(link));
+        aimBone(link, axis);
+        link = boneChild(link);
+      }
+      continue;
     }
+
     bone.parent!.getWorldQuaternion(parentQ);
     const qWorld = new THREE.Quaternion().setFromAxisAngle(zAxis, (left ? 1 : -1) * rad);
     const qLocal = parentQ.clone().invert().multiply(qWorld).multiply(parentQ);
     bone.quaternion.copy(qLocal.multiply(restQ));
+  }
+}
+
+/** Restore arm bones cached by poseArms to their rest rotations (and positions). */
+export function resetArms(restQuats: Map<THREE.Bone, THREE.Quaternion>): void {
+  for (const [bone, q] of restQuats) {
+    bone.quaternion.copy(q);
+    const restPos = bone.userData.restPos as THREE.Vector3 | undefined;
+    if (restPos) bone.position.copy(restPos);
   }
 }
 

@@ -11,6 +11,7 @@ import {
   fitFrame,
   loadGltf,
   poseArms,
+  resetArms,
   resetConform,
 } from "../lib/rig";
 
@@ -52,10 +53,16 @@ export function RigPanel({ garmentUrl }: Props) {
   const [offZ, setOffZ] = useState(0);
   const [rotY, setRotY] = useState(0);
   const [armDeg, setArmDeg] = useState(0);
+  const [tPose, setTPose] = useState(true);
   const [conformed, setConformed] = useState(false);
   const [pose, setPose] = useState("");
   const [error, setError] = useState<string | null>(null);
   const armRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
+  // Exports go out in the skeleton's bind pose so they match body.glb; the ref
+  // suppresses the pose effect (and re-entrant clicks) for the export's
+  // duration, and the tick re-runs that effect from fresh state afterwards.
+  const exporting = useRef(false);
+  const [exportTick, setExportTick] = useState(0);
 
   // Build the scene once the dressing room is opened.
   useEffect(() => {
@@ -79,9 +86,6 @@ export function RigPanel({ garmentUrl }: Props) {
 
         const scene = new THREE.Scene();
         scene.add(new THREE.HemisphereLight(0xffffff, 0x333344, 2.4));
-        const dir = new THREE.DirectionalLight(0xffffff, 2);
-        dir.position.set(2, 3, 2);
-        scene.add(dir);
 
         const bodyRoot = bodyGltf.scene;
         // Tripo/FBX exports often mark the skin material as alpha-blended,
@@ -114,6 +118,17 @@ export function RigPanel({ garmentUrl }: Props) {
         camera.position.set(center.x, center.y + bodyHeight * 0.1, center.z + bodyHeight * 1.8);
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.target.copy(center);
+
+        // Key/fill ride with the camera, so whichever side is facing the viewer
+        // is the side that is lit. Positions are camera-local: -Z is forward.
+        const key = new THREE.DirectionalLight(0xffffff, 1.8);
+        key.position.set(0.5, 0.8, 1);
+        key.target.position.set(0, 0, -1);
+        const fill = new THREE.DirectionalLight(0xffffff, 0.5);
+        fill.position.set(-0.8, -0.2, 0.6);
+        fill.target.position.set(0, 0, -1);
+        camera.add(key, key.target, fill, fill.target);
+        scene.add(camera);
 
         // Center the garment inside a group so fitting is scale + position only.
         let garmentGroup: THREE.Group | null = null;
@@ -168,6 +183,15 @@ export function RigPanel({ garmentUrl }: Props) {
     };
   }, [phase, garmentUrl]);
 
+  // The avatar's static pose (T-pose by default) whenever no clip is playing.
+  // Runs before the fit effect so garment placement sees the posed skeleton.
+  useEffect(() => {
+    const bag = bagRef.current;
+    if (!bag || phase === "loading" || pose || exporting.current) return;
+    poseArms(bag.bodyMesh, armRest.current, armDeg, tPose);
+    bag.bodyRoot.updateMatrixWorld(true);
+  }, [phase, pose, armDeg, tPose, exportTick]);
+
   // Re-apply the fit whenever kind or a slider changes.
   useEffect(() => {
     const bag = bagRef.current;
@@ -188,15 +212,7 @@ export function RigPanel({ garmentUrl }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [phase, kind, fitMode, lengthMult, widthMult, offX, offY, offZ, rotY]);
-
-  // Pose the avatar's arms to line up with the garment's sleeves.
-  useEffect(() => {
-    const bag = bagRef.current;
-    if (!bag || phase !== "fitting") return;
-    poseArms(bag.bodyMesh, armRest.current, armDeg);
-    bag.bodyRoot.updateMatrixWorld(true);
-  }, [phase, armDeg]);
+  }, [phase, kind, fitMode, lengthMult, widthMult, offX, offY, offZ, rotY, pose, tPose, armDeg]);
 
   // Dispose the renderer on unmount.
   useEffect(
@@ -211,15 +227,28 @@ export function RigPanel({ garmentUrl }: Props) {
     [],
   );
 
+  /** Stop any clip and return the skeleton to its bind pose. */
   function stopPose(bag: Bag) {
     bag.mixer?.stopAllAction();
     bag.bodyMesh.skeleton.pose();
+    resetArms(armRest.current);
+    bag.bodyRoot.updateMatrixWorld(true);
+  }
+
+  /** Bind pose + the current static pose (T-pose / arm angle). */
+  function restPose(bag: Bag) {
+    stopPose(bag);
+    poseArms(bag.bodyMesh, armRest.current, armDeg, tPose);
+    bag.bodyRoot.updateMatrixWorld(true);
   }
 
   function bind() {
     const bag = bagRef.current;
     if (!bag?.garmentGroup) return;
     setError(null);
+    // Weights are sampled off the live body surface, so never bind mid-clip.
+    setPose("");
+    restPose(bag);
     try {
       const meshes = collectMeshes(bag.garmentGroup);
       if (meshes.length === 0) throw new Error("garment has no meshes");
@@ -235,6 +264,8 @@ export function RigPanel({ garmentUrl }: Props) {
     const bag = bagRef.current;
     if (!bag?.garmentGroup) return;
     setError(null);
+    setPose("");
+    restPose(bag);
     try {
       const clearance = 0.008 * bag.bodyHeight;
       const influence = clearance + 0.08 * bag.bodyHeight;
@@ -257,7 +288,7 @@ export function RigPanel({ garmentUrl }: Props) {
   function refit() {
     const bag = bagRef.current;
     if (!bag?.garmentGroup) return;
-    stopPose(bag);
+    restPose(bag);
     setPose("");
     bag.rigged.forEach((m) => m.parent?.remove(m));
     bag.rigged = [];
@@ -270,7 +301,7 @@ export function RigPanel({ garmentUrl }: Props) {
     if (!bag) return;
     setPose(name);
     if (!name) {
-      stopPose(bag);
+      restPose(bag);
       return;
     }
     bag.mixer ??= new THREE.AnimationMixer(bag.bodyRoot);
@@ -281,9 +312,11 @@ export function RigPanel({ garmentUrl }: Props) {
 
   async function download(dressed: boolean) {
     const bag = bagRef.current;
-    if (!bag) return;
+    // Overlapping exports would walk a scene the other one has detached.
+    if (!bag || exporting.current) return;
     setError(null);
     setPose("");
+    exporting.current = true;
     stopPose(bag);
     // For a garment-only export, temporarily detach the body's own meshes so
     // the file keeps just the skeleton + rigged garment.
@@ -309,6 +342,10 @@ export function RigPanel({ garmentUrl }: Props) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       detached.forEach(([m, parent]) => parent.add(m));
+      exporting.current = false;
+      // Re-pose via the effect so it picks up any change made during the
+      // export rather than the values captured when the click happened.
+      setExportTick((t) => t + 1);
     }
   }
 
@@ -327,6 +364,15 @@ export function RigPanel({ garmentUrl }: Props) {
                 <option key={c.name}>{c.name}</option>
               ))}
             </select>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={tPose}
+              disabled={!!pose}
+              onChange={(e) => setTPose(e.target.checked)}
+            />
+            T-pose
           </label>
         </div>
       )}
