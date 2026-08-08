@@ -286,6 +286,16 @@ button.link {
 .rig-sliders input[type="range"] {
   flex: 1;
   accent-color: var(--accent);
+  min-width: 0;
+}
+
+.slider-value {
+  flex: none;
+  width: 3.4em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+  color: var(--muted);
 }
 
 .rig-canvas {

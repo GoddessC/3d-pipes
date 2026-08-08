@@ -3,7 +3,7 @@ import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js"
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { MeshBVH } from "three-mesh-bvh";
 
-export type GarmentKind = "top" | "bottom" | "head";
+export type GarmentKind = "top" | "bottom" | "head" | "face";
 
 // Bone names vary wildly between rigs (Maya QuickRig "QuickRigCharacter2_LeftUpLeg",
 // Tripo "L_Thigh" / "L_ThighTwist01", Mixamo "mixamorig:LeftUpLeg", …), so bones
@@ -51,11 +51,18 @@ const BONE_SUBSETS: Record<GarmentKind, BoneRole[]> = {
   bottom: ["hips", "upperleg", "lowerleg", "foot", "toe"],
   top: ["hips", "spine", "shoulder", "upperarm", "forearm", "hand", "neck"],
   head: ["head", "neck"],
+  // Eyes/brows/pupils must ride the skull rigidly — any neck blend smears them.
+  face: ["head"],
 };
 
 // If a garment vertex ends up with no weight on allowed bones (e.g. a top
 // vertex nearest to a leg), it is pinned entirely to this role's first bone.
-const ANCHOR_ROLE: Record<GarmentKind, BoneRole> = { bottom: "hips", top: "spine", head: "head" };
+const ANCHOR_ROLE: Record<GarmentKind, BoneRole> = {
+  bottom: "hips",
+  top: "spine",
+  head: "head",
+  face: "head",
+};
 
 export function allowedBoneIndices(skeleton: THREE.Skeleton, kind: GarmentKind): Set<number> {
   const roles = new Set<BoneRole>(BONE_SUBSETS[kind]);
@@ -93,6 +100,26 @@ export function collectMeshes(root: THREE.Object3D): THREE.Mesh[] {
   return meshes;
 }
 
+/** How far forward of the head-bone centre the face surface sits, in head spans. */
+const FACE_FORWARD = 0.48;
+
+/**
+ * Which way the avatar faces, taken from the feet (toes lead the ankles).
+ * Flattened to horizontal so a tilted foot bone can't skew the result.
+ */
+function facing(byRole: Map<BoneRole, THREE.Vector3[]>): THREE.Vector3 {
+  const avg = (pts: THREE.Vector3[]) =>
+    pts.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(pts.length);
+  const foot = byRole.get("foot");
+  const toe = byRole.get("toe");
+  if (foot?.length && toe?.length) {
+    const dir = avg(toe).sub(avg(foot));
+    dir.y = 0;
+    if (dir.lengthSq() > 1e-8) return dir.normalize();
+  }
+  return new THREE.Vector3(0, 0, 1);
+}
+
 export interface FitFrame {
   /** World-space center of the region the garment should cover. */
   center: THREE.Vector3;
@@ -125,7 +152,7 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
     throw new Error(`no ${roles.join("/")} bone found in body.glb`);
   };
 
-  if (kind === "head") {
+  if (kind === "head" || kind === "face") {
     const pts = byRole.get("head");
     if (!pts?.length) throw new Error("no head bone found in body.glb");
     const center = pts.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(pts.length);
@@ -133,6 +160,16 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
     const ys = pts.map((p) => p.y);
     let span = Math.max(...ys) - Math.min(...ys);
     if (span < 1e-4) span = Math.abs(center.y - at("neck", "shoulder").y) * 2;
+    // Hats/hair wrap the whole skull, so they anchor at its centre. Eyes and
+    // brows sit on the face, roughly half a head-span forward of that centre —
+    // anchoring them at the centre leaves them stranded inside the skull, out
+    // of reach of the (deliberately fine) depth slider.
+    if (kind === "face") {
+      return {
+        center: center.clone().addScaledVector(facing(byRole), span * FACE_FORWARD),
+        height: span * 0.4,
+      };
+    }
     return { center, height: span * 1.5 };
   }
 
@@ -590,6 +627,42 @@ export function conformMeshToBody(
   pos.needsUpdate = true;
   geo.computeVertexNormals();
   geo.computeBoundingSphere();
+}
+
+/**
+ * Copy of `mesh` reflected across the body's midline (world x=0), baked into
+ * world space with identity transform so it can be bound directly. Used to
+ * place one of a paired facial feature and get the other for free — safe only
+ * for parts bound to centre bones, since it does not swap Left/Right joints.
+ */
+export function mirrorAcrossX(mesh: THREE.Mesh): THREE.Mesh {
+  mesh.updateMatrixWorld(true);
+  const geometry = mesh.geometry.clone();
+  geometry.applyMatrix4(mesh.matrixWorld);
+
+  const pos = geometry.attributes.position as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) pos.setX(i, -pos.getX(i));
+  pos.needsUpdate = true;
+  const nrm = geometry.attributes.normal as THREE.BufferAttribute | undefined;
+  if (nrm) {
+    for (let i = 0; i < nrm.count; i++) nrm.setX(i, -nrm.getX(i));
+    nrm.needsUpdate = true;
+  }
+  // Reflection flips handedness, so triangles need rewinding to face outward.
+  const index = geometry.index;
+  if (index) {
+    for (let i = 0; i < index.count; i += 3) {
+      const t = index.getX(i);
+      index.setX(i, index.getX(i + 2));
+      index.setX(i + 2, t);
+    }
+    index.needsUpdate = true;
+  }
+  geometry.computeBoundingSphere();
+
+  const out = new THREE.Mesh(geometry, mesh.material);
+  out.name = `${mesh.name || "garment"}_mirrored`;
+  return out;
 }
 
 /** Restore a mesh's shape from before its first conformMeshToBody call. */

@@ -7,6 +7,7 @@ import {
   collectMeshes,
   conformMeshToBody,
   exportGlb,
+  mirrorAcrossX,
   findBodyMesh,
   fitFrame,
   loadGltf,
@@ -22,6 +23,33 @@ interface Props {
 
 // "idle" = avatar only, no garment loaded yet.
 type Phase = "loading" | "idle" | "fitting" | "bound";
+
+// Kinds bound entirely to centre bones, so a mirrored copy needs no L/R swap.
+const CENTRE_BOUND = new Set<GarmentKind>(["head", "face"]);
+
+function Slider({
+  label,
+  value,
+  onChange,
+  digits = 3,
+  ...range
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  digits?: number;
+  min: number;
+  max: number;
+  step: number;
+}) {
+  return (
+    <label>
+      {label}
+      <input type="range" {...range} value={value} onChange={(e) => onChange(Number(e.target.value))} />
+      <span className="slider-value">{value.toFixed(digits)}</span>
+    </label>
+  );
+}
 
 interface Bag {
   renderer: THREE.WebGLRenderer;
@@ -55,6 +83,7 @@ export function RigPanel({ garmentUrl }: Props) {
   const [armDeg, setArmDeg] = useState(0);
   const [tPose, setTPose] = useState(true);
   const [conformed, setConformed] = useState(false);
+  const [mirror, setMirror] = useState(false);
   const [pose, setPose] = useState("");
   const [error, setError] = useState<string | null>(null);
   const armRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
@@ -197,16 +226,20 @@ export function RigPanel({ garmentUrl }: Props) {
     const bag = bagRef.current;
     if (!bag?.garmentGroup || phase !== "fitting") return;
     try {
+      const frame = fitFrame(bag.bodyRoot, kind);
       // "authored" keeps the file's own placement (for assets built in body
       // space); "auto" scales/centers the garment onto the body region.
-      const anchor = fitMode === "authored" ? bag.garmentCenter : fitFrame(bag.bodyRoot, kind).center;
-      const base = fitMode === "authored" ? 1 : fitFrame(bag.bodyRoot, kind).height / bag.garmentSize;
+      const anchor = fitMode === "authored" ? bag.garmentCenter : frame.center;
+      const base = fitMode === "authored" ? 1 : frame.height / bag.garmentSize;
       // length scales the garment vertically, width its girth (side + front-to-back).
       bag.garmentGroup.scale.set(base * widthMult, base * lengthMult, base * widthMult);
+      // Nudge range follows the fitted region, so an eyebrow gets face-sized
+      // precision from the same slider that moves a jacket torso-sized amounts.
+      const nudge = frame.height * 0.6;
       bag.garmentGroup.position.set(
-        anchor.x + offX * bag.bodyHeight * 0.25,
-        anchor.y + offY * bag.bodyHeight * 0.25,
-        anchor.z + offZ * bag.bodyHeight * 0.25,
+        anchor.x + offX * nudge,
+        anchor.y + offY * nudge,
+        anchor.z + offZ * nudge,
       );
       bag.garmentGroup.rotation.y = (rotY * Math.PI) / 180;
     } catch (err) {
@@ -252,7 +285,11 @@ export function RigPanel({ garmentUrl }: Props) {
     try {
       const meshes = collectMeshes(bag.garmentGroup);
       if (meshes.length === 0) throw new Error("garment has no meshes");
-      bag.rigged = meshes.map((m) => bindGarment(m, bag.bodyMesh, kind));
+      // Mirroring is only safe for centre-bone parts (it doesn't swap L/R joints).
+      const toBind = mirror && CENTRE_BOUND.has(kind)
+        ? meshes.flatMap((m) => [m, mirrorAcrossX(m)])
+        : meshes;
+      bag.rigged = toBind.map((m) => bindGarment(m, bag.bodyMesh, kind));
       bag.scene.remove(bag.garmentGroup);
       setPhase("bound");
     } catch (err) {
@@ -333,11 +370,17 @@ export function RigPanel({ garmentUrl }: Props) {
     }
     try {
       const blob = await exportGlb(bag.bodyRoot, bag.clips);
+      // The anchor has to be in the document for the click to count, and the
+      // blob URL has to outlive it — revoking synchronously cancels the save.
+      const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
+      a.href = url;
       a.download = dressed ? "avatar-dressed.glb" : `${kind}-rigged.glb`;
+      a.style.display = "none";
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(a.href);
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -388,8 +431,15 @@ export function RigPanel({ garmentUrl }: Props) {
             <option value="top">top (upper body)</option>
             <option value="bottom">bottom (lower body)</option>
             <option value="head">head (hat/hair)</option>
+            <option value="face">face (eyes/brows)</option>
           </select>
         </label>
+        {CENTRE_BOUND.has(kind) && phase === "fitting" && (
+          <label>
+            <input type="checkbox" checked={mirror} onChange={(e) => setMirror(e.target.checked)} />
+            mirror
+          </label>
+        )}
         <label>
           placement
           <select
@@ -422,41 +472,13 @@ export function RigPanel({ garmentUrl }: Props) {
 
       {phase === "fitting" && (
         <div className="rig-sliders">
-          <label>
-            length
-            <input type="range" min={0.4} max={2} step={0.01} value={lengthMult}
-              onChange={(e) => setLengthMult(Number(e.target.value))} />
-          </label>
-          <label>
-            width
-            <input type="range" min={0.4} max={2} step={0.01} value={widthMult}
-              onChange={(e) => setWidthMult(Number(e.target.value))} />
-          </label>
-          <label>
-            side
-            <input type="range" min={-1} max={1} step={0.01} value={offX}
-              onChange={(e) => setOffX(Number(e.target.value))} />
-          </label>
-          <label>
-            height
-            <input type="range" min={-1} max={1} step={0.01} value={offY}
-              onChange={(e) => setOffY(Number(e.target.value))} />
-          </label>
-          <label>
-            depth
-            <input type="range" min={-1} max={1} step={0.01} value={offZ}
-              onChange={(e) => setOffZ(Number(e.target.value))} />
-          </label>
-          <label>
-            rotate
-            <input type="range" min={0} max={360} step={1} value={rotY}
-              onChange={(e) => setRotY(Number(e.target.value))} />
-          </label>
-          <label>
-            arms
-            <input type="range" min={-90} max={90} step={1} value={armDeg}
-              onChange={(e) => setArmDeg(Number(e.target.value))} />
-          </label>
+          <Slider label="length" min={0.05} max={2} step={0.005} value={lengthMult} onChange={setLengthMult} />
+          <Slider label="width" min={0.05} max={2} step={0.005} value={widthMult} onChange={setWidthMult} />
+          <Slider label="side" min={-1} max={1} step={0.005} value={offX} onChange={setOffX} />
+          <Slider label="height" min={-1} max={1} step={0.005} value={offY} onChange={setOffY} />
+          <Slider label="depth" min={-1} max={1} step={0.005} value={offZ} onChange={setOffZ} />
+          <Slider label="rotate" min={0} max={360} step={1} value={rotY} onChange={setRotY} digits={0} />
+          <Slider label="arms" min={-90} max={90} step={1} value={armDeg} onChange={setArmDeg} digits={0} />
         </div>
       )}
 
