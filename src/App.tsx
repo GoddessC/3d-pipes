@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   VIEW_ORDER,
   type MeshyKind,
@@ -41,6 +41,7 @@ export default function App() {
   const [posterUrl, setPosterUrl] = useState<string | null>(null);
   const [lastTaskId, setLastTaskId] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [loaded, setLoaded] = useState<{ url: string; name: string } | null>(null);
   const rawModelUrl = useRef<string | null>(null);
 
   const provided = VIEW_ORDER.filter((v) => images[v]);
@@ -51,7 +52,24 @@ export default function App() {
   const rigTestParam = import.meta.env.DEV
     ? new URLSearchParams(window.location.search).get("rigtest")
     : null;
-  const garmentUrl = modelUrl ?? (rigTestParam !== null ? rigTestParam || "/body.glb" : null);
+  // A hand-loaded file wins over the last generation, so an existing asset gets
+  // the same preview → fit → conform → bind → export path.
+  const garmentUrl =
+    loaded?.url ?? modelUrl ?? (rigTestParam !== null ? rigTestParam || "/body.glb" : null);
+
+  function loadGlb(file: File | undefined) {
+    if (!file) return;
+    if (loaded) URL.revokeObjectURL(loaded.url);
+    setLoaded({ url: URL.createObjectURL(file), name: file.name });
+    setError(null);
+  }
+
+  function clearLoaded() {
+    if (loaded) URL.revokeObjectURL(loaded.url);
+    setLoaded(null);
+  }
+
+  useEffect(() => () => { if (loaded) URL.revokeObjectURL(loaded.url); }, [loaded]);
 
   function publishResult(taskId: string, type: string, url: string, posterRaw: string | null) {
     rawModelUrl.current = url;
@@ -190,8 +208,30 @@ export default function App() {
           {error && <p className="error">{error}</p>}
 
           <h2>Garment</h2>
-          <Viewer src={modelUrl} poster={posterUrl} />
-          {modelUrl && (
+          <div className="row">
+            <label className="button">
+              Load .glb
+              <input
+                type="file"
+                accept=".glb,.gltf,model/gltf-binary"
+                hidden
+                onChange={(e) => {
+                  loadGlb(e.target.files?.[0]);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+            {loaded && (
+              <>
+                <span className="muted">{loaded.name}</span>
+                <button className="link" onClick={clearLoaded}>
+                  clear
+                </button>
+              </>
+            )}
+          </div>
+          <Viewer src={garmentUrl} poster={loaded ? null : posterUrl} />
+          {!loaded && modelUrl && (
             <div className="row output-actions">
               <a className="button" href={modelUrl} download="model.glb">
                 Download GLB

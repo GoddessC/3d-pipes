@@ -651,12 +651,24 @@ export function mirrorAcrossX(mesh: THREE.Mesh): THREE.Mesh {
   // Reflection flips handedness, so triangles need rewinding to face outward.
   const index = geometry.index;
   if (index) {
-    for (let i = 0; i < index.count; i += 3) {
+    for (let i = 0; i + 2 < index.count; i += 3) {
       const t = index.getX(i);
       index.setX(i, index.getX(i + 2));
       index.setX(i + 2, t);
     }
     index.needsUpdate = true;
+  } else {
+    // Non-indexed geometry (glTF allows it) would otherwise keep its original
+    // winding and render inside-out. Adding a reversed index rewinds every
+    // triangle without having to shuffle each attribute buffer in step.
+    const n = pos.count - (pos.count % 3);
+    const order = new Uint32Array(n);
+    for (let i = 0; i < n; i += 3) {
+      order[i] = i + 2;
+      order[i + 1] = i + 1;
+      order[i + 2] = i;
+    }
+    geometry.setIndex(new THREE.BufferAttribute(order, 1));
   }
   geometry.computeBoundingSphere();
 
