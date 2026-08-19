@@ -443,6 +443,80 @@ export function poseArms(
 }
 
 /** Restore arm bones cached by poseArms to their rest rotations (and positions). */
+/** Morph target names on the body, e.g. Feel_Joyful. Empty if it has none. */
+export function expressionNames(root: THREE.Object3D): string[] {
+  const names: string[] = [];
+  root.traverse((o) => {
+    const dict = (o as THREE.Mesh).morphTargetDictionary;
+    if (!dict) return;
+    for (const n of Object.keys(dict)) if (!names.includes(n)) names.push(n);
+  });
+  return names;
+}
+
+/**
+ * Drive one expression to full and clear the rest.
+ *
+ * The body exports as one primitive per material (skin, mouth interior,
+ * teeth), so the targets are duplicated across three meshes and all of them
+ * have to be set or the lips move without the cavity behind them.
+ */
+export function setExpression(root: THREE.Object3D, name: string): void {
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    const dict = mesh.morphTargetDictionary;
+    const inf = mesh.morphTargetInfluences;
+    if (!dict || !inf) return;
+    inf.fill(0);
+    const i = dict[name];
+    if (i !== undefined) inf[i] = 1;
+  });
+}
+
+/** The jaw bone, if the rig has one. Named `mixamorig:Jaw` on our avatar. */
+export function findJaw(body: THREE.SkinnedMesh): THREE.Bone | null {
+  return body.skeleton.bones.find((b) => /jaw/i.test(b.name)) ?? null;
+}
+
+/**
+ * Open the jaw by `openDeg` about the world X axis, from its rest orientation.
+ *
+ * Rotating in world space rather than in the bone's local frame keeps "open"
+ * meaning the same thing whatever roll the jaw bone was authored with. Rest is
+ * captured on first call, so this must run once before any clip plays.
+ */
+export function poseJaw(
+  body: THREE.SkinnedMesh,
+  restQuats: Map<THREE.Bone, THREE.Quaternion>,
+  openDeg: number,
+): boolean {
+  const jaw = findJaw(body);
+  if (!jaw) return false;
+  let rest = restQuats.get(jaw);
+  if (!rest) {
+    rest = jaw.quaternion.clone();
+    restQuats.set(jaw, rest);
+  }
+  if (openDeg === 0) {
+    jaw.quaternion.copy(rest);
+    return true;
+  }
+  jaw.updateWorldMatrix(true, false);
+  // world rotation R on a bone under parent world rotation P is P^-1 * R * P
+  const parentQ = (jaw.parent as THREE.Object3D).getWorldQuaternion(new THREE.Quaternion());
+  const qWorld = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(1, 0, 0),
+    (openDeg * Math.PI) / 180,
+  );
+  jaw.quaternion
+    .copy(parentQ)
+    .invert()
+    .multiply(qWorld)
+    .multiply(parentQ)
+    .multiply(rest);
+  return true;
+}
+
 export function resetArms(restQuats: Map<THREE.Bone, THREE.Quaternion>): void {
   for (const [bone, q] of restQuats) {
     bone.quaternion.copy(q);

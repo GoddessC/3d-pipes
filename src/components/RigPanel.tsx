@@ -12,6 +12,10 @@ import {
   fitFrame,
   loadGltf,
   poseArms,
+  poseJaw,
+  findJaw,
+  expressionNames,
+  setExpression,
   resetArms,
   resetConform,
 } from "../lib/rig";
@@ -26,6 +30,14 @@ type Phase = "loading" | "idle" | "fitting" | "bound";
 
 // Kinds bound entirely to centre bones, so a mirrored copy needs no L/R swap.
 const CENTRE_BOUND = new Set<GarmentKind>(["head", "face"]);
+
+// How far the jaw drops for each baked expression. The morph target carries the
+// lip shape only -- openness stays on the bone, which does it properly.
+const EXPRESSION_JAW: Record<string, number> = {
+  Feel_Joyful: 10, Feel_Happy: 4, Feel_Excited: 16, Feel_Silly: 6,
+  Feel_Okay: 0, Feel_Calm: 0, Feel_Sleepy: 3, Feel_Hungry: 12,
+  Feel_Sick: 2, Feel_Sad: 0, Feel_Worried: 1, Feel_Scared: 8, Feel_Angry: 6,
+};
 
 function Slider({
   label,
@@ -59,6 +71,7 @@ interface Bag {
   bodyMesh: THREE.SkinnedMesh;
   bodyHeight: number;
   clips: THREE.AnimationClip[];
+  expressions: string[];
   garmentGroup: THREE.Group | null;
   garmentSize: number;
   garmentCenter: THREE.Vector3;
@@ -81,12 +94,17 @@ export function RigPanel({ garmentUrl }: Props) {
   const [offZ, setOffZ] = useState(0);
   const [rotY, setRotY] = useState(0);
   const [armDeg, setArmDeg] = useState(0);
+  const [jawDeg, setJawDeg] = useState(0);
+  const [expr, setExpr] = useState("");
   const [tPose, setTPose] = useState(true);
   const [conformed, setConformed] = useState(false);
   const [mirror, setMirror] = useState(false);
   const [pose, setPose] = useState("");
   const [error, setError] = useState<string | null>(null);
   const armRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
+  const jawRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
+  // Read by the render loop, which is created once and never re-runs.
+  const jawDegRef = useRef(0);
   // Exports go out in the skeleton's bind pose so they match body.glb; the ref
   // suppresses the pose effect (and re-entrant clicks) for the export's
   // duration, and the tick re-runs that effect from fresh state afterwards.
@@ -183,6 +201,7 @@ export function RigPanel({ garmentUrl }: Props) {
           bodyMesh,
           bodyHeight,
           clips: bodyGltf.animations,
+          expressions: expressionNames(bodyRoot),
           garmentGroup,
           garmentSize,
           garmentCenter,
@@ -197,6 +216,10 @@ export function RigPanel({ garmentUrl }: Props) {
         const loop = () => {
           bag.raf = requestAnimationFrame(loop);
           bag.mixer?.update(clock.getDelta());
+          // After the mixer, not in an effect: the Idle clip carries a jaw
+          // track (the exporter writes one for every bone) that would
+          // otherwise overwrite the slider on each frame.
+          if (!exporting.current) poseJaw(bag.bodyMesh, jawRest.current, jawDegRef.current);
           controls.update();
           renderer.render(scene, camera);
         };
@@ -220,6 +243,19 @@ export function RigPanel({ garmentUrl }: Props) {
     poseArms(bag.bodyMesh, armRest.current, armDeg, tPose);
     bag.bodyRoot.updateMatrixWorld(true);
   }, [phase, pose, armDeg, tPose, exportTick]);
+
+  useEffect(() => {
+    jawDegRef.current = jawDeg;
+  }, [jawDeg]);
+
+  function selectExpression(name: string) {
+    const bag = bagRef.current;
+    if (!bag) return;
+    setExpr(name);
+    setExpression(bag.bodyRoot, name);
+    // Seed the slider so the pose reads right straight away, and stays editable.
+    setJawDeg(EXPRESSION_JAW[name] ?? 0);
+  }
 
   // Re-apply the fit whenever kind or a slider changes.
   useEffect(() => {
@@ -417,6 +453,22 @@ export function RigPanel({ garmentUrl }: Props) {
             />
             T-pose
           </label>
+          {!!bagRef.current?.expressions.length && (
+            <label>
+              feeling
+              <select value={expr} onChange={(e) => selectExpression(e.target.value)}>
+                <option value="">neutral</option>
+                {bagRef.current.expressions.map((n) => (
+                  <option key={n} value={n}>
+                    {n.replace(/^Feel_/, "").toLowerCase()}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {bagRef.current && findJaw(bagRef.current.bodyMesh) && (
+            <Slider label="mouth" min={0} max={30} step={1} value={jawDeg} onChange={setJawDeg} digits={0} />
+          )}
         </div>
       )}
       {(phase === "fitting" || phase === "bound") && (
