@@ -3,7 +3,7 @@ import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js"
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { MeshBVH } from "three-mesh-bvh";
 
-export type GarmentKind = "top" | "bottom" | "head" | "face";
+export type GarmentKind = "top" | "bottom" | "head" | "face" | "hair";
 
 // Bone names vary wildly between rigs (Maya QuickRig "QuickRigCharacter2_LeftUpLeg",
 // Tripo "L_Thigh" / "L_ThighTwist01", Mixamo "mixamorig:LeftUpLeg", …), so bones
@@ -50,9 +50,12 @@ export function boneRole(name: string): BoneRole | null {
 const BONE_SUBSETS: Record<GarmentKind, BoneRole[]> = {
   bottom: ["hips", "upperleg", "lowerleg", "foot", "toe"],
   top: ["hips", "spine", "shoulder", "upperarm", "forearm", "hand", "neck"],
-  head: ["head", "neck"],
-  // Eyes/brows/pupils must ride the skull rigidly — any neck blend smears them.
+  // Hats/hair must ride the skull rigidly, same as eyes/brows below: a vertex
+  // that blends head+neck weight interpolates between two different rotations
+  // once the neck articulates independently (e.g. the Idle clip), and shears.
+  head: ["head"],
   face: ["head"],
+  hair: ["head"],
 };
 
 // If a garment vertex ends up with no weight on allowed bones (e.g. a top
@@ -62,6 +65,7 @@ const ANCHOR_ROLE: Record<GarmentKind, BoneRole> = {
   top: "spine",
   head: "head",
   face: "head",
+  hair: "head",
 };
 
 export function allowedBoneIndices(skeleton: THREE.Skeleton, kind: GarmentKind): Set<number> {
@@ -98,6 +102,22 @@ export function collectMeshes(root: THREE.Object3D): THREE.Mesh[] {
     if (o instanceof THREE.Mesh) meshes.push(o);
   });
   return meshes;
+}
+
+/**
+ * Unique materials on a garment that can be recoloured live -- a flat colour
+ * with no base-colour texture. Textured (Meshy-generated) materials are left
+ * alone: multiplying a photoreal texture by a swatch just muddies it.
+ */
+export function tintableMaterials(root: THREE.Object3D): THREE.MeshStandardMaterial[] {
+  const found = new Set<THREE.MeshStandardMaterial>();
+  for (const mesh of collectMeshes(root)) {
+    for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+      const std = m as THREE.MeshStandardMaterial;
+      if (std.color && !std.map) found.add(std);
+    }
+  }
+  return [...found];
 }
 
 /** How far forward of the head-bone centre the face surface sits, in head spans. */
@@ -152,7 +172,7 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
     throw new Error(`no ${roles.join("/")} bone found in body.glb`);
   };
 
-  if (kind === "head" || kind === "face") {
+  if (kind === "head" || kind === "face" || kind === "hair") {
     const pts = byRole.get("head");
     if (!pts?.length) throw new Error("no head bone found in body.glb");
     const center = pts.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(pts.length);

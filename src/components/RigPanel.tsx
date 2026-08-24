@@ -16,6 +16,7 @@ import {
   findJaw,
   expressionNames,
   setExpression,
+  tintableMaterials,
   resetArms,
   resetConform,
 } from "../lib/rig";
@@ -29,7 +30,7 @@ interface Props {
 type Phase = "loading" | "idle" | "fitting" | "bound";
 
 // Kinds bound entirely to centre bones, so a mirrored copy needs no L/R swap.
-const CENTRE_BOUND = new Set<GarmentKind>(["head", "face"]);
+const CENTRE_BOUND = new Set<GarmentKind>(["head", "face", "hair"]);
 
 // How far the jaw drops for each baked expression. The morph target carries the
 // lip shape only -- openness stays on the bone, which does it properly.
@@ -56,7 +57,7 @@ function Slider({
 }) {
   return (
     <label>
-      {label}
+      <span className="field-label">{label}</span>
       <input type="range" {...range} value={value} onChange={(e) => onChange(Number(e.target.value))} />
       <span className="slider-value">{value.toFixed(digits)}</span>
     </label>
@@ -100,6 +101,8 @@ export function RigPanel({ garmentUrl }: Props) {
   const [conformed, setConformed] = useState(false);
   const [mirror, setMirror] = useState(false);
   const [pose, setPose] = useState("");
+  // "" when the garment has no untextured material to recolour.
+  const [tint, setTint] = useState("");
   const [error, setError] = useState<string | null>(null);
   const armRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
   const jawRest = useRef(new Map<THREE.Bone, THREE.Quaternion>());
@@ -191,6 +194,8 @@ export function RigPanel({ garmentUrl }: Props) {
           garmentGroup = new THREE.Group();
           garmentGroup.add(gScene);
           scene.add(garmentGroup);
+          const tints = tintableMaterials(garmentGroup);
+          setTint(tints.length ? `#${tints[0].color.getHexString()}` : "");
         }
 
         const bag: Bag = {
@@ -255,6 +260,13 @@ export function RigPanel({ garmentUrl }: Props) {
     setExpression(bag.bodyRoot, name);
     // Seed the slider so the pose reads right straight away, and stays editable.
     setJawDeg(EXPRESSION_JAW[name] ?? 0);
+  }
+
+  function pickColor(hex: string) {
+    setTint(hex);
+    const bag = bagRef.current;
+    if (!bag?.garmentGroup) return;
+    for (const m of tintableMaterials(bag.garmentGroup)) m.color.set(hex);
   }
 
   // Re-apply the fit whenever kind or a slider changes.
@@ -434,9 +446,9 @@ export function RigPanel({ garmentUrl }: Props) {
         <p className="muted">Generate an item to preview and rig it on the avatar.</p>
       )}
       {phase !== "loading" && (
-        <div className="row">
+        <div className="row rig-toolbar">
           <label>
-            animation
+            <span className="field-label">animation</span>
             <select value={pose} onChange={(e) => selectPose(e.target.value)}>
               <option value="">rest</option>
               {bagRef.current?.clips.map((c) => (
@@ -455,7 +467,7 @@ export function RigPanel({ garmentUrl }: Props) {
           </label>
           {!!bagRef.current?.expressions.length && (
             <label>
-              feeling
+              <span className="field-label">feeling</span>
               <select value={expr} onChange={(e) => selectExpression(e.target.value)}>
                 <option value="">neutral</option>
                 {bagRef.current.expressions.map((n) => (
@@ -472,9 +484,9 @@ export function RigPanel({ garmentUrl }: Props) {
         </div>
       )}
       {(phase === "fitting" || phase === "bound") && (
-      <div className="row">
+      <div className="row rig-toolbar">
         <label>
-          garment
+          <span className="field-label">garment</span>
           <select
             value={kind}
             disabled={phase === "bound"}
@@ -482,7 +494,8 @@ export function RigPanel({ garmentUrl }: Props) {
           >
             <option value="top">top (upper body)</option>
             <option value="bottom">bottom (lower body)</option>
-            <option value="head">head (hat/hair)</option>
+            <option value="head">head (hat)</option>
+            <option value="hair">hair</option>
             <option value="face">face (eyes/brows)</option>
           </select>
         </label>
@@ -492,8 +505,14 @@ export function RigPanel({ garmentUrl }: Props) {
             mirror
           </label>
         )}
+        {tint && (
+          <label>
+            color
+            <input type="color" value={tint} onChange={(e) => pickColor(e.target.value)} />
+          </label>
+        )}
         <label>
-          placement
+          <span className="field-label">placement</span>
           <select
             value={fitMode}
             disabled={phase === "bound"}
@@ -504,20 +523,20 @@ export function RigPanel({ garmentUrl }: Props) {
           </select>
         </label>
         {phase === "fitting" && (
-          <>
+          <div className="row toolbar-actions">
             <button onClick={conform}>Conform to body</button>
             {conformed && <button onClick={resetShape}>Reset shape</button>}
             <button className="primary" onClick={bind}>
               Bind to skeleton
             </button>
-          </>
+          </div>
         )}
         {phase === "bound" && (
-          <>
+          <div className="row toolbar-actions">
             <button onClick={refit}>Re-fit</button>
             <button onClick={() => download(false)}>Garment GLB</button>
             <button onClick={() => download(true)}>Dressed GLB</button>
-          </>
+          </div>
         )}
       </div>
       )}

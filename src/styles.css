@@ -262,14 +262,14 @@ button.link {
 .rig-panel {
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: 0.75rem;
   margin-top: 0.25rem;
 }
 
 .rig-panel label {
   display: flex;
   align-items: center;
-  gap: 0.35rem;
+  gap: 0.4rem;
   font-size: 0.85rem;
 }
 
@@ -277,10 +277,53 @@ button.link {
   width: auto;
 }
 
+.rig-toolbar {
+  background: #1c1c24;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.65rem 0.85rem;
+  row-gap: 0.6rem;
+  column-gap: 1.1rem;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.toolbar-actions {
+  margin-left: auto;
+}
+
+.rig-panel input[type="color"] {
+  width: 1.8rem;
+  height: 1.8rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+
 .rig-sliders {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 0.4rem 1rem;
+  gap: 0.55rem 1.5rem;
+  background: #1c1c24;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 0.85rem;
+}
+
+.rig-sliders label {
+  gap: 0.6rem;
+}
+
+.rig-sliders .field-label {
+  flex: none;
+  width: 3.6em;
 }
 
 .rig-sliders input[type="range"] {
