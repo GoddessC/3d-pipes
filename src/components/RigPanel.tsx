@@ -325,7 +325,10 @@ export function RigPanel({ garmentUrl }: Props) {
 
   function bind() {
     const bag = bagRef.current;
-    if (!bag?.garmentGroup) return;
+    // rigged non-empty means a bind already ran; a second pass would re-bind
+    // the already un-posed meshes and mangle them (state updates are async, so
+    // a double-click reaches here twice while phase still reads "fitting").
+    if (!bag?.garmentGroup || bag.rigged.length > 0) return;
     setError(null);
     // Weights are sampled off the live body surface, so never bind mid-clip.
     setPose("");

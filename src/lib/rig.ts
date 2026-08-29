@@ -211,9 +211,60 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
  * un-posed back into bind space with the inverse of its own skinning matrix so
  * the result is a proper bind-pose skin.
  *
+ * Weights come from the body only where the fabric is CLOSE to it; everything
+ * else inherits by diffusion across the garment's own surface. Fabric that
+ * hangs away from the body (sleeve hems, skirt tails) is deliberately not
+ * matched spatially: a hanging cuff can sit nearer the hip than the wrist,
+ * and any nearest-feature choice flips between neighbouring verts and tears
+ * the fabric the moment the pose changes. Cloth follows what it is sewn to,
+ * and diffusion through the mesh is exactly that.
+ *
  * `geometry` must already be in the body mesh's local space, aligned with the
  * posed body as currently rendered.
  */
+/**
+ * Uniform hash grid over the posed body vertices, for radius queries. The
+ * garment is a shell standing off the body, so its weights are BLENDED from
+ * every body vertex within a radius rather than copied from the single
+ * closest triangle: at the shoulder the closest feature flips between arm
+ * and trapezius from one garment vertex to the next, and copying gives
+ * neighbouring fabric verts disjoint bones — invisible in the pose it was
+ * bound in (the un-pose inverts it exactly) but tearing the moment the arms
+ * move. A fixed-radius blend keeps the field continuous across the fabric.
+ */
+class VertexGrid {
+  private cells = new Map<string, number[]>();
+  constructor(private pts: Float32Array, private cell: number) {
+    for (let i = 0; i < pts.length / 3; i++) {
+      const key = this.keyAt(pts[i * 3], pts[i * 3 + 1], pts[i * 3 + 2]);
+      const arr = this.cells.get(key);
+      if (arr) arr.push(i);
+      else this.cells.set(key, [i]);
+    }
+  }
+  private keyAt(x: number, y: number, z: number): string {
+    const c = this.cell;
+    return `${Math.floor(x / c)},${Math.floor(y / c)},${Math.floor(z / c)}`;
+  }
+  forEachInRadius(p: THREE.Vector3, r: number, fn: (i: number, d2: number) => void): void {
+    const c = this.cell, r2 = r * r;
+    const x0 = Math.floor((p.x - r) / c), x1 = Math.floor((p.x + r) / c);
+    const y0 = Math.floor((p.y - r) / c), y1 = Math.floor((p.y + r) / c);
+    const z0 = Math.floor((p.z - r) / c), z1 = Math.floor((p.z + r) / c);
+    for (let gx = x0; gx <= x1; gx++)
+      for (let gy = y0; gy <= y1; gy++)
+        for (let gz = z0; gz <= z1; gz++) {
+          const ids = this.cells.get(`${gx},${gy},${gz}`);
+          if (!ids) continue;
+          for (const i of ids) {
+            const dx = this.pts[i * 3] - p.x, dy = this.pts[i * 3 + 1] - p.y, dz = this.pts[i * 3 + 2] - p.z;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 <= r2) fn(i, d2);
+          }
+        }
+  }
+}
+
 /**
  * Body surface in its current pose, in mesh-local space (getVertexPosition
  * applies bind matrix + bone matrices per vertex for skinned meshes).
@@ -284,26 +335,124 @@ export function transferWeights(
   const normalMat = new THREE.Matrix3();
   const n = new THREE.Vector3();
 
+  // Fabric within this distance of the body samples weights from it directly;
+  // everything farther inherits by diffusion across the garment surface.
+  const posedPos = posedGeo.attributes.position.array as Float32Array;
+  const bodySpan = new THREE.Box3().setFromBufferAttribute(
+    posedGeo.attributes.position as THREE.BufferAttribute,
+  );
+  const seedRadius = bodySpan.getSize(new THREE.Vector3()).y * 0.028;
+  const grid = new VertexGrid(posedPos, seedRadius);
+
+  // Weld coincident verts (glTF splits them at UV seams) so diffusion crosses
+  // seams; otherwise every panel border would block it.
+  const weldOf = new Map<string, number>();
+  const rep = new Int32Array(count);
   for (let v = 0; v < count; v++) {
+    const key = `${Math.round(pos.getX(v) * 2e4)},${Math.round(pos.getY(v) * 2e4)},${Math.round(pos.getZ(v) * 2e4)}`;
+    const r = weldOf.get(key);
+    if (r === undefined) {
+      weldOf.set(key, v);
+      rep[v] = v;
+    } else rep[v] = r;
+  }
+  const adj = new Map<number, Set<number>>();
+  const link = (a: number, b: number) => {
+    if (a === b) return;
+    (adj.get(a) ?? adj.set(a, new Set()).get(a)!).add(b);
+    (adj.get(b) ?? adj.set(b, new Set()).get(b)!).add(a);
+  };
+  const gIndex = geometry.index;
+  const triCount = gIndex ? gIndex.count : count;
+  for (let t = 0; t < triCount; t += 3) {
+    const a = rep[gIndex ? gIndex.getX(t) : t];
+    const b = rep[gIndex ? gIndex.getX(t + 1) : t + 1];
+    const c = rep[gIndex ? gIndex.getX(t + 2) : t + 2];
+    link(a, b); link(b, c); link(c, a);
+  }
+
+  // Per-representative weights: blend the skin weights of every body vertex
+  // in range, kernel-weighted so influence fades smoothly at the radius edge.
+  // The radius grows with distance from the body: a sleeve vert 8cm out that
+  // is near-equidistant from arm and torso must blend both, or the nearest-
+  // feature choice flips between neighbouring verts and tears the fabric.
+  const weights = new Map<number, Map<number, number>>();
+  for (let v = 0; v < count; v++) {
+    if (rep[v] !== v) continue;
     point.fromBufferAttribute(pos, v);
     bvh.closestPointToPoint(point, target);
-
-    const f = target.faceIndex * 3;
-    const ids = [0, 1, 2].map((k) => (index ? index.getX(f + k) : f + k));
-    ids.forEach((id, k) => corner[k].fromBufferAttribute(posedGeo.attributes.position, id));
-    tri.set(corner[0], corner[1], corner[2]);
-    tri.getBarycoord(target.point, bary);
-    const baryW = [bary.x, bary.y, bary.z];
-
-    // Accumulate per-bone weight across the triangle's corners.
+    const radius = Math.max(seedRadius, target.distance * 1.4);
     const acc = new Map<number, number>();
-    ids.forEach((id, k) => {
+    grid.forEachInRadius(point, radius, (id, d2) => {
+      const t = 1 - d2 / (radius * radius);
+      const kern = t * t * t;
       for (let c = 0; c < 4; c++) {
         const bone = srcIndex.getComponent(id, c);
-        const w = srcWeight.getComponent(id, c) * baryW[k];
+        const w = srcWeight.getComponent(id, c) * kern;
         if (w > 0 && allowed.has(bone)) acc.set(bone, (acc.get(bone) ?? 0) + w);
       }
     });
+    let gathered = 0;
+    acc.forEach((w) => (gathered += w));
+    if (gathered > 1e-3) {
+      // Normalize so smoothing mixes directions, not kernel magnitudes.
+      const norm = new Map<number, number>();
+      acc.forEach((w, bone) => norm.set(bone, w / gathered));
+      weights.set(v, norm);
+    }
+  }
+
+  // Iron out residual discontinuities — chiefly the top-4 truncation flip,
+  // where near-tied bones make adjacent verts keep a different 4th influence.
+  const averageOf = (ids: number[]) => {
+    const m = new Map<number, number>();
+    let n = 0;
+    for (const id of ids) {
+      const w = weights.get(id);
+      if (!w) continue;
+      n++;
+      w.forEach((x, bone) => m.set(bone, (m.get(bone) ?? 0) + x));
+    }
+    if (n === 0) return null;
+    m.forEach((x, bone) => m.set(bone, x / n));
+    return m;
+  };
+  for (let pass = 0; pass < 8; pass++) {
+    const next = new Map<number, Map<number, number>>();
+    for (const [v, w] of weights) {
+      const avg = averageOf([...(adj.get(v) ?? [])]);
+      if (!avg) continue;
+      const m = new Map<number, number>();
+      w.forEach((x, bone) => m.set(bone, x * 0.5));
+      avg.forEach((x, bone) => m.set(bone, (m.get(bone) ?? 0) + x * 0.5));
+      next.set(v, m);
+    }
+    next.forEach((m, v) => weights.set(v, m));
+  }
+
+  for (let v = 0; v < count; v++) {
+    point.fromBufferAttribute(pos, v);
+    let acc = weights.get(rep[v]);
+
+    // No path to any seed (a detached island floating off the body): sample
+    // the nearest surface triangle, as an isolated sample beats no sample.
+    if (!acc) {
+      acc = new Map<number, number>();
+      bvh.closestPointToPoint(point, target);
+      const f = target.faceIndex * 3;
+      const ids = [0, 1, 2].map((k) => (index ? index.getX(f + k) : f + k));
+      ids.forEach((id, k) => corner[k].fromBufferAttribute(posedGeo.attributes.position, id));
+      tri.set(corner[0], corner[1], corner[2]);
+      tri.getBarycoord(target.point, bary);
+      const baryW = [bary.x, bary.y, bary.z];
+      ids.forEach((id, k) => {
+        for (let c = 0; c < 4; c++) {
+          const bone = srcIndex.getComponent(id, c);
+          const w = srcWeight.getComponent(id, c) * baryW[k];
+          if (w > 0 && allowed.has(bone)) acc!.set(bone, (acc!.get(bone) ?? 0) + w);
+        }
+      });
+    }
 
     let entries = [...acc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
     let total = entries.reduce((s, [, w]) => s + w, 0);
@@ -599,8 +748,10 @@ export function conformMeshToBody(
   influence: number,
   strength: number,
 ): void {
-  mesh.updateMatrixWorld(true);
-  body.updateMatrixWorld(true);
+  // updateParents=true: matrixWorld is read below, and the fit effect may have
+  // just moved an ancestor group that no frame has composed yet.
+  mesh.updateWorldMatrix(true, true);
+  body.updateWorldMatrix(true, true);
   const geo = mesh.geometry;
   const pos = geo.attributes.position as THREE.BufferAttribute;
   const count = pos.count;
@@ -730,7 +881,7 @@ export function conformMeshToBody(
  * for parts bound to centre bones, since it does not swap Left/Right joints.
  */
 export function mirrorAcrossX(mesh: THREE.Mesh): THREE.Mesh {
-  mesh.updateMatrixWorld(true);
+  mesh.updateWorldMatrix(true, true);
   const geometry = mesh.geometry.clone();
   geometry.applyMatrix4(mesh.matrixWorld);
 
@@ -791,14 +942,20 @@ export function bindGarment(
   body: THREE.SkinnedMesh,
   kind: GarmentKind,
 ): THREE.SkinnedMesh {
-  mesh.updateMatrixWorld(true);
-  body.updateMatrixWorld(true);
+  // updateParents=true: matrixWorld is read below, and the fit effect may have
+  // just moved an ancestor group that no frame has composed yet.
+  mesh.updateWorldMatrix(true, true);
+  body.updateWorldMatrix(true, true);
 
   const geometry = mesh.geometry.clone();
-  const toBodyLocal = new THREE.Matrix4()
-    .copy(body.matrixWorld)
-    .invert()
-    .multiply(mesh.matrixWorld);
+  // A garment that is itself skinned (a re-loaded export) renders at its own
+  // skeleton's pose and ignores every ancestor transform, so the fit group's
+  // scale/offset never showed on screen — flattening matrixWorld in would
+  // teleport the geometry away from where the user saw it. Bind what is
+  // displayed: for skinned garments that is the file's own bind-space
+  // placement, for plain meshes the fitted transform.
+  const toBodyLocal = new THREE.Matrix4().copy(body.matrixWorld).invert();
+  if (!(mesh as THREE.SkinnedMesh).isSkinnedMesh) toBodyLocal.multiply(mesh.matrixWorld);
   geometry.applyMatrix4(toBodyLocal);
 
   transferWeights(geometry, body, kind);
