@@ -430,6 +430,61 @@ export function transferWeights(
     next.forEach((m, v) => weights.set(v, m));
   }
 
+  // The body's own deltoid skin rightly follows the humerus, but clothing
+  // draped OVER the shoulder does not: a yoke (or headphones on the collar)
+  // stays with the torso when the arm lowers, and only fabric genuinely out
+  // along the arm follows it. Sampled arm influence is therefore faded out for
+  // fabric inboard of the deltoid — measured along the arm axis from the
+  // shoulder joint — and handed to that side's clavicle. This also strips the
+  // stray arm weight that torso-side fabric below the armpit picks up, which
+  // otherwise dents the shoulder line the moment the pose leaves the bind.
+  if (kind === "top") {
+    const isLeftName = (n: string) => /left|(^|[^a-z])l[_\-.]/.test(n.toLowerCase());
+    const sides: Array<{
+      origin: THREE.Vector3; axis: THREE.Vector3; len: number;
+      armBones: Set<number>; clavicle: number;
+    }> = [];
+    for (let b = 0; b < bones.length; b++) {
+      if (boneRole(bones[b].name) !== "upperarm") continue;
+      const left = isLeftName(bones[b].name);
+      const armBones = new Set<number>();
+      let clavicle = -1;
+      for (let k = 0; k < bones.length; k++) {
+        if (isLeftName(bones[k].name) !== left) continue;
+        const role = boneRole(bones[k].name);
+        if (role === "upperarm" || role === "forearm" || role === "hand") armBones.add(k);
+        if (role === "shoulder") clavicle = k;
+      }
+      const elbow = bones[b].children.find((c) => (c as THREE.Bone).isBone);
+      if (!elbow || clavicle < 0) continue;
+      const origin = bones[b].getWorldPosition(new THREE.Vector3());
+      const axis = elbow.getWorldPosition(new THREE.Vector3()).sub(origin);
+      const len = axis.length();
+      if (len < 1e-6) continue;
+      sides.push({ origin, axis: axis.normalize(), len, armBones, clavicle });
+    }
+    const arm = new THREE.Vector3();
+    for (const [v, w] of weights) {
+      point.fromBufferAttribute(pos, v);
+      for (const side of sides) {
+        const t = arm.copy(point).sub(side.origin).dot(side.axis) / side.len;
+        // 0 inboard of the deltoid → all arm weight becomes clavicle;
+        // 1 past mid-biceps → sleeve fabric keeps full arm influence.
+        const u = Math.min(1, Math.max(0, (t - 0.2) / 0.45));
+        const keep = u * u * (3 - 2 * u);
+        if (keep >= 1) continue;
+        let moved = 0;
+        for (const b of side.armBones) {
+          const x = w.get(b);
+          if (!x) continue;
+          w.set(b, x * keep);
+          moved += x * (1 - keep);
+        }
+        if (moved > 0) w.set(side.clavicle, (w.get(side.clavicle) ?? 0) + moved);
+      }
+    }
+  }
+
   for (let v = 0; v < count; v++) {
     point.fromBufferAttribute(pos, v);
     let acc = weights.get(rep[v]);
@@ -493,6 +548,15 @@ export function transferWeights(
  * garment's sleeve angle before binding. `angleDeg` is relative to the rest
  * pose; `restQuats` caches each arm bone's rest rotation across calls.
  */
+// Relaxed stance applied to the rest pose (non-T-pose): the raw bind pose
+// hangs the arms perfectly straight and clamped to the sides, which reads as a
+// mannequin. A few degrees of outward arm angle plus a soft elbow bend (hands
+// drifting forward, forearms angling out — the natural carrying angle) make
+// rest look like standing instead of rigor.
+const RELAX_ABDUCT = (5 * Math.PI) / 180;
+const RELAX_ELBOW = (10 * Math.PI) / 180;
+const RELAX_CARRY = (3 * Math.PI) / 180;
+
 export function poseArms(
   body: THREE.SkinnedMesh,
   restQuats: Map<THREE.Bone, THREE.Quaternion>,
@@ -500,6 +564,7 @@ export function poseArms(
   tPose = false,
 ): void {
   const rad = (angleDeg * Math.PI) / 180;
+  const xAxis = new THREE.Vector3(1, 0, 0);
   const zAxis = new THREE.Vector3(0, 0, 1);
   const parentQ = new THREE.Quaternion();
 
@@ -605,9 +670,27 @@ export function poseArms(
     }
 
     bone.parent!.getWorldQuaternion(parentQ);
-    const qWorld = new THREE.Quaternion().setFromAxisAngle(zAxis, (left ? 1 : -1) * rad);
+    const qWorld = new THREE.Quaternion().setFromAxisAngle(
+      zAxis,
+      (left ? 1 : -1) * (rad + RELAX_ABDUCT),
+    );
     const qLocal = parentQ.clone().invert().multiply(qWorld).multiply(parentQ);
     bone.quaternion.copy(qLocal.multiply(restQ));
+    bone.updateWorldMatrix(false, true);
+
+    let forearm = boneChild(bone);
+    while (forearm && boneRole(forearm.name) !== "forearm") forearm = boneChild(forearm);
+    if (forearm) {
+      const fRest = rest(forearm);
+      forearm.parent!.getWorldQuaternion(parentQ);
+      // Negative about +X: the avatar faces +Z, and rotating the hanging
+      // forearm by a positive X angle sends the hand backward, not forward.
+      const qBend = new THREE.Quaternion()
+        .setFromAxisAngle(xAxis, -RELAX_ELBOW)
+        .multiply(new THREE.Quaternion().setFromAxisAngle(zAxis, (left ? 1 : -1) * RELAX_CARRY));
+      const qFor = parentQ.clone().invert().multiply(qBend).multiply(parentQ);
+      forearm.quaternion.copy(qFor.multiply(fRest));
+    }
   }
 }
 
