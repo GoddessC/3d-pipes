@@ -90,6 +90,7 @@ export function RigPanel({ garmentUrl }: Props) {
   const [fitMode, setFitMode] = useState<"auto" | "authored">("auto");
   const [lengthMult, setLengthMult] = useState(1);
   const [widthMult, setWidthMult] = useState(1);
+  const [depthMult, setDepthMult] = useState(1);
   const [offX, setOffX] = useState(0);
   const [offY, setOffY] = useState(0);
   const [offZ, setOffZ] = useState(0);
@@ -279,8 +280,10 @@ export function RigPanel({ garmentUrl }: Props) {
       // space); "auto" scales/centers the garment onto the body region.
       const anchor = fitMode === "authored" ? bag.garmentCenter : frame.center;
       const base = fitMode === "authored" ? 1 : frame.height / bag.garmentSize;
-      // length scales the garment vertically, width its girth (side + front-to-back).
-      bag.garmentGroup.scale.set(base * widthMult, base * lengthMult, base * widthMult);
+      // length scales the garment vertically, width side-to-side, depth
+      // front-to-back — scaled in the garment's own frame, so they still mean
+      // the same thing after the rotate slider turns it.
+      bag.garmentGroup.scale.set(base * widthMult, base * lengthMult, base * depthMult);
       // Nudge range follows the fitted region, so an eyebrow gets face-sized
       // precision from the same slider that moves a jacket torso-sized amounts.
       const nudge = frame.height * 0.6;
@@ -293,7 +296,7 @@ export function RigPanel({ garmentUrl }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [phase, kind, fitMode, lengthMult, widthMult, offX, offY, offZ, rotY, pose, tPose, armDeg]);
+  }, [phase, kind, fitMode, lengthMult, widthMult, depthMult, offX, offY, offZ, rotY, pose, tPose, armDeg]);
 
   // Dispose the renderer on unmount.
   useEffect(
@@ -548,9 +551,10 @@ export function RigPanel({ garmentUrl }: Props) {
         <div className="rig-sliders">
           <Slider label="length" min={0.05} max={2} step={0.005} value={lengthMult} onChange={setLengthMult} />
           <Slider label="width" min={0.05} max={2} step={0.005} value={widthMult} onChange={setWidthMult} />
+          <Slider label="depth" min={0.05} max={2} step={0.005} value={depthMult} onChange={setDepthMult} />
           <Slider label="side" min={-1} max={1} step={0.005} value={offX} onChange={setOffX} />
           <Slider label="height" min={-1} max={1} step={0.005} value={offY} onChange={setOffY} />
-          <Slider label="depth" min={-1} max={1} step={0.005} value={offZ} onChange={setOffZ} />
+          <Slider label="front-back" min={-1} max={1} step={0.005} value={offZ} onChange={setOffZ} />
           <Slider label="rotate" min={0} max={360} step={1} value={rotY} onChange={setRotY} digits={0} />
           <Slider label="arms" min={-90} max={90} step={1} value={armDeg} onChange={setArmDeg} digits={0} />
         </div>
