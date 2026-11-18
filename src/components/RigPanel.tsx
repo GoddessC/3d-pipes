@@ -8,6 +8,12 @@ import {
   conformMeshToBody,
   exportGlb,
   mirrorAcrossX,
+  mirrorAcrossPlane,
+  reflectionMatrix,
+  footFrames,
+  bodyFacing,
+  sagittalPlane,
+  type FootFrame,
   findBodyMesh,
   fitFrame,
   loadGltf,
@@ -76,6 +82,16 @@ interface Bag {
   garmentGroup: THREE.Group | null;
   garmentSize: number;
   garmentCenter: THREE.Vector3;
+  /** Longest horizontal extent of the garment as loaded (a shoe's heel-to-toe). */
+  garmentLength: number;
+  /** Whether that longest extent runs along the garment's own x axis. */
+  garmentLongX: boolean;
+  /** Live mirrored copy of the garment, shown on the other foot while fitting shoes. */
+  mirrorGroup: THREE.Group | null;
+  /** Each foot measured in the rest pose; empty if the rig has no feet. */
+  feet: FootFrame[];
+  facing: THREE.Vector3;
+  midPlane: THREE.Plane | null;
   rigged: THREE.SkinnedMesh[];
   mixer: THREE.AnimationMixer | null;
   raf: number;
@@ -184,17 +200,30 @@ export function RigPanel({ garmentUrl }: Props) {
         // Center the garment inside a group so fitting is scale + position only.
         let garmentGroup: THREE.Group | null = null;
         let garmentSize = 1;
+        let garmentLength = 1;
+        let garmentLongX = false;
+        let mirrorGroup: THREE.Group | null = null;
         const garmentCenter = new THREE.Vector3();
         if (garmentGltf) {
           const gScene = garmentGltf.scene;
           const gBox = new THREE.Box3().setFromObject(gScene);
           const gCenter = gBox.getCenter(new THREE.Vector3());
           garmentCenter.copy(gCenter);
-          garmentSize = Math.max(gBox.getSize(new THREE.Vector3()).y, 1e-6);
+          const gSize = gBox.getSize(new THREE.Vector3());
+          garmentSize = Math.max(gSize.y, 1e-6);
+          garmentLength = Math.max(gSize.x, gSize.z, 1e-6);
+          garmentLongX = gSize.x >= gSize.z;
           gScene.position.sub(gCenter);
           garmentGroup = new THREE.Group();
           garmentGroup.add(gScene);
           scene.add(garmentGroup);
+          // Shares geometry and materials, so conforming or recolouring the
+          // fitted shoe shows on its mirror twin too. Its matrix is set by hand
+          // (a reflection of the fitted group's), so auto-update is off.
+          mirrorGroup = garmentGroup.clone(true);
+          mirrorGroup.matrixAutoUpdate = false;
+          mirrorGroup.visible = false;
+          scene.add(mirrorGroup);
           const tints = tintableMaterials(garmentGroup);
           setTint(tints.length ? `#${tints[0].color.getHexString()}` : "");
         }
@@ -211,6 +240,12 @@ export function RigPanel({ garmentUrl }: Props) {
           garmentGroup,
           garmentSize,
           garmentCenter,
+          garmentLength,
+          garmentLongX,
+          mirrorGroup,
+          feet: [],
+          facing: new THREE.Vector3(0, 0, 1),
+          midPlane: null,
           rigged: [],
           mixer: null,
           raf: 0,
@@ -276,6 +311,11 @@ export function RigPanel({ garmentUrl }: Props) {
     if (!bag?.garmentGroup || phase !== "fitting") return;
     try {
       const frame = fitFrame(bag.bodyRoot, kind);
+      if (kind === "shoes" && fitMode === "auto") {
+        fitShoe(bag);
+        return;
+      }
+      if (bag.mirrorGroup) bag.mirrorGroup.visible = false;
       // "authored" keeps the file's own placement (for assets built in body
       // space); "auto" scales/centers the garment onto the body region.
       const anchor = fitMode === "authored" ? bag.garmentCenter : frame.center;
@@ -296,7 +336,7 @@ export function RigPanel({ garmentUrl }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [phase, kind, fitMode, lengthMult, widthMult, depthMult, offX, offY, offZ, rotY, pose, tPose, armDeg]);
+  }, [phase, kind, fitMode, lengthMult, widthMult, depthMult, offX, offY, offZ, rotY, pose, tPose, armDeg, mirror]);
 
   // Dispose the renderer on unmount.
   useEffect(
@@ -310,6 +350,49 @@ export function RigPanel({ garmentUrl }: Props) {
     },
     [],
   );
+
+  /** Measure the feet once (rest pose), the first time shoes are fitted. */
+  function ensureFeet(bag: Bag) {
+    if (bag.midPlane) return;
+    bag.facing = bodyFacing(bag.bodyRoot);
+    bag.midPlane = sagittalPlane(bag.bodyRoot);
+    bag.feet = footFrames(bag.bodyMesh, bag.bodyRoot);
+    if (bag.feet.length === 0) throw new Error("could not measure the avatar's feet");
+  }
+
+  /**
+   * Stand the shoe on one foot: heel-to-toe scaled to the foot's length, long
+   * axis turned along the way the avatar faces, sole on the floor. The mirror
+   * twin is the same placement reflected across the body's midline, so it
+   * lands on the other foot.
+   */
+  function fitShoe(bag: Bag) {
+    const group = bag.garmentGroup!;
+    ensureFeet(bag);
+    // Fit onto the foot on the negative side of the midline; the twin takes the other.
+    const foot = [...bag.feet].sort(
+      (a, b) => bag.midPlane!.distanceToPoint(a.center) - bag.midPlane!.distanceToPoint(b.center),
+    )[0];
+    // A little longer than the bare foot, for the sole and toe box.
+    const base = (foot.length * 1.08) / bag.garmentLength;
+    group.scale.set(base * widthMult, base * lengthMult, base * depthMult);
+    const f = bag.facing;
+    const autoYaw = bag.garmentLongX ? Math.atan2(-f.z, f.x) : Math.atan2(f.x, f.z);
+    group.rotation.set(0, autoYaw + (rotY * Math.PI) / 180, 0);
+    const nudge = foot.length * 0.6;
+    const halfHeight = (bag.garmentSize * base * lengthMult) / 2;
+    group.position.set(
+      foot.center.x + offX * nudge,
+      foot.soleY + halfHeight + offY * nudge,
+      foot.center.z + offZ * nudge,
+    );
+    group.updateMatrix();
+    if (bag.mirrorGroup) {
+      bag.mirrorGroup.visible = mirror;
+      bag.mirrorGroup.matrix.multiplyMatrices(reflectionMatrix(bag.midPlane!), group.matrix);
+      bag.mirrorGroup.matrixWorldNeedsUpdate = true;
+    }
+  }
 
   /** Stop any clip and return the skeleton to its bind pose. */
   function stopPose(bag: Bag) {
@@ -340,11 +423,18 @@ export function RigPanel({ garmentUrl }: Props) {
       const meshes = collectMeshes(bag.garmentGroup);
       if (meshes.length === 0) throw new Error("garment has no meshes");
       // Mirroring is only safe for centre-bone parts (it doesn't swap L/R joints).
-      const toBind = mirror && CENTRE_BOUND.has(kind)
-        ? meshes.flatMap((m) => [m, mirrorAcrossX(m)])
-        : meshes;
+      let toBind = meshes;
+      if (mirror && CENTRE_BOUND.has(kind)) {
+        toBind = meshes.flatMap((m) => [m, mirrorAcrossX(m)]);
+      } else if (mirror && kind === "shoes") {
+        // The twin is reflected across the body's own midline onto the other
+        // foot; binding then ties each shoe to whichever foot it sits on.
+        ensureFeet(bag);
+        toBind = meshes.flatMap((m) => [m, mirrorAcrossPlane(m, bag.midPlane!)]);
+      }
       bag.rigged = toBind.map((m) => bindGarment(m, bag.bodyMesh, kind));
       bag.scene.remove(bag.garmentGroup);
+      if (bag.mirrorGroup) bag.scene.remove(bag.mirrorGroup);
       setPhase("bound");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -360,8 +450,11 @@ export function RigPanel({ garmentUrl }: Props) {
     try {
       const clearance = 0.008 * bag.bodyHeight;
       const influence = clearance + 0.08 * bag.bodyHeight;
+      // Shoes only push out where the foot pokes through: pulling them in
+      // toward the skin, as clothes are, would melt the sole and toe box.
+      const strength = kind === "shoes" ? 0 : 0.8;
       collectMeshes(bag.garmentGroup).forEach((m) =>
-        conformMeshToBody(m, bag.bodyMesh, clearance, influence, 0.8),
+        conformMeshToBody(m, bag.bodyMesh, clearance, influence, strength),
       );
       setConformed(true);
     } catch (err) {
@@ -384,6 +477,7 @@ export function RigPanel({ garmentUrl }: Props) {
     bag.rigged.forEach((m) => m.parent?.remove(m));
     bag.rigged = [];
     bag.scene.add(bag.garmentGroup);
+    if (bag.mirrorGroup) bag.scene.add(bag.mirrorGroup);
     setPhase("fitting");
   }
 
@@ -496,19 +590,25 @@ export function RigPanel({ garmentUrl }: Props) {
           <select
             value={kind}
             disabled={phase === "bound"}
-            onChange={(e) => setKind(e.target.value as GarmentKind)}
+            onChange={(e) => {
+              const next = e.target.value as GarmentKind;
+              setKind(next);
+              // One generated shoe is meant to become a pair.
+              if (next === "shoes") setMirror(true);
+            }}
           >
             <option value="top">top (upper body)</option>
             <option value="bottom">bottom (lower body)</option>
             <option value="head">head (hat)</option>
             <option value="hair">hair</option>
             <option value="face">face (eyes/brows)</option>
+            <option value="shoes">shoes</option>
           </select>
         </label>
-        {CENTRE_BOUND.has(kind) && phase === "fitting" && (
+        {(CENTRE_BOUND.has(kind) || kind === "shoes") && phase === "fitting" && (
           <label>
             <input type="checkbox" checked={mirror} onChange={(e) => setMirror(e.target.checked)} />
-            mirror
+            {kind === "shoes" ? "mirror to other foot" : "mirror"}
           </label>
         )}
         {tint && (
