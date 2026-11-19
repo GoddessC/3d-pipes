@@ -1200,6 +1200,153 @@ export function mirrorAcrossPlane(mesh: THREE.Mesh, plane: THREE.Plane): THREE.M
   return out;
 }
 
+/** One shoe cut out of a generated pair, in the pair's own (root-local) space. */
+export interface ShoePiece {
+  meshes: THREE.Mesh[];
+  /** Bounding-box centre and size of this shoe, root-local. */
+  center: THREE.Vector3;
+  size: THREE.Vector3;
+}
+
+/**
+ * Split a generated PAIR of shoes into its two shoes. Meshy often returns a
+ * pair as one mesh, sometimes with the shoes fused where they touch, so this
+ * does not rely on separate pieces: it looks along each horizontal axis of
+ * `root` for the emptiest slice in the middle of the model (the gap between
+ * the shoes) and cuts every triangle by which side of it the triangle's
+ * centre falls. A single shoe has no such gap along either axis, so null
+ * means "this is one shoe". Returned meshes are new (geometry compacted to
+ * the triangles kept) and positioned in `root`'s local space.
+ */
+export function splitShoePair(root: THREE.Object3D): { pieces: [ShoePiece, ShoePiece]; axis: "x" | "z" } | null {
+  root.updateWorldMatrix(true, true);
+  const toRoot = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  const sources = collectMeshes(root).map((m) => {
+    const geo = m.geometry.clone();
+    geo.applyMatrix4(new THREE.Matrix4().multiplyMatrices(toRoot, m.matrixWorld));
+    const material = Array.isArray(m.material) ? m.material[0] : m.material;
+    return { geo, material, name: m.name };
+  });
+  if (sources.length === 0) return null;
+
+  // Surface-area histogram along each horizontal axis: every triangle spreads
+  // its area over the slices it spans. Area rather than vertex counts, so a
+  // coarse grid-like mesh (vertices only on a few columns) cannot fake a gap.
+  const BINS = 64;
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const tri = new THREE.Triangle();
+  const forEachTri = (fn: (i0: number, i1: number, i2: number, geo: THREE.BufferGeometry) => void) => {
+    for (const { geo } of sources) {
+      const idx = geo.index;
+      const n = (idx ? idx.count : geo.attributes.position.count) / 3;
+      for (let t = 0; t < n; t++) {
+        fn(idx ? idx.getX(t * 3) : t * 3, idx ? idx.getX(t * 3 + 1) : t * 3 + 1, idx ? idx.getX(t * 3 + 2) : t * 3 + 2, geo);
+      }
+    }
+  };
+  let best: { axis: "x" | "z"; cut: number; score: number } | null = null;
+  for (const axis of ["x", "z"] as const) {
+    const get = (v: THREE.Vector3) => (axis === "x" ? v.x : v.z);
+    let lo = Infinity, hi = -Infinity;
+    for (const { geo } of sources) {
+      const pos = geo.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const v = axis === "x" ? pos.getX(i) : pos.getZ(i);
+        lo = Math.min(lo, v); hi = Math.max(hi, v);
+      }
+    }
+    if (hi - lo < 1e-9) continue;
+    const binOf = (v: number) => Math.min(BINS - 1, Math.max(0, Math.floor(((v - lo) / (hi - lo)) * BINS)));
+    const bins = new Array<number>(BINS).fill(0);
+    let total = 0, below = 0;
+    const centres: Array<[number, number]> = [];
+    forEachTri((i0, i1, i2, geo) => {
+      const pos = geo.attributes.position as THREE.BufferAttribute;
+      a.fromBufferAttribute(pos, i0); b.fromBufferAttribute(pos, i1); c.fromBufferAttribute(pos, i2);
+      const area = tri.set(a, b, c).getArea();
+      const b0 = binOf(Math.min(get(a), get(b), get(c)));
+      const b1 = binOf(Math.max(get(a), get(b), get(c)));
+      for (let k = b0; k <= b1; k++) bins[k] += area / (b1 - b0 + 1);
+      total += area;
+      centres.push([(get(a) + get(b) + get(c)) / 3, area]);
+    });
+    // Only the middle of the model can hold the gap between two shoes.
+    let minBin = -1;
+    for (let k = Math.floor(BINS * 0.25); k <= Math.ceil(BINS * 0.75); k++) {
+      if (minBin < 0 || bins[k] < bins[minBin]) minBin = k;
+    }
+    const sorted = bins.filter((n) => n > 0).sort((x, y) => x - y);
+    const median = sorted[sorted.length >> 1] || 1;
+    const score = bins[minBin] / median; // 0 = clean gap, ~1 = solid
+    const cut = lo + ((minBin + 0.5) / BINS) * (hi - lo);
+    for (const [centre, area] of centres) if (centre < cut) below += area;
+    const balanced = below > total * 0.2 && below < total * 0.8;
+    if (balanced && score < 0.1 && (!best || score < best.score)) best = { axis, cut, score };
+  }
+  if (!best) return null;
+
+  const sides: [THREE.Mesh[], THREE.Mesh[]] = [[], []];
+  for (const { geo, material, name } of sources) {
+    const pos = geo.attributes.position;
+    const idx = geo.index;
+    const triCount = (idx ? idx.count : pos.count) / 3;
+    const keep: [number[], number[]] = [[], []];
+    for (let t = 0; t < triCount; t++) {
+      const i0 = idx ? idx.getX(t * 3) : t * 3;
+      const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+      const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+      a.fromBufferAttribute(pos, i0); b.fromBufferAttribute(pos, i1); c.fromBufferAttribute(pos, i2);
+      const centre = best.axis === "x" ? (a.x + b.x + c.x) / 3 : (a.z + b.z + c.z) / 3;
+      keep[centre < best.cut ? 0 : 1].push(i0, i1, i2);
+    }
+    keep.forEach((tris, side) => {
+      if (tris.length === 0) return;
+      const mesh = new THREE.Mesh(compactGeometry(geo, tris), material);
+      mesh.name = `${name || "shoe"}_${side === 0 ? "a" : "b"}`;
+      sides[side].push(mesh);
+    });
+  }
+  if (!sides[0].length || !sides[1].length) return null;
+  const piece = (meshes: THREE.Mesh[]): ShoePiece => {
+    const box = new THREE.Box3();
+    for (const m of meshes) {
+      m.geometry.computeBoundingBox();
+      box.union(m.geometry.boundingBox!);
+    }
+    return { meshes, center: box.getCenter(new THREE.Vector3()), size: box.getSize(new THREE.Vector3()) };
+  };
+  return { pieces: [piece(sides[0]), piece(sides[1])], axis: best.axis };
+}
+
+/** New geometry holding only the given triangles (vertex indices into `geo`). */
+function compactGeometry(geo: THREE.BufferGeometry, tris: number[]): THREE.BufferGeometry {
+  const remap = new Map<number, number>();
+  const order: number[] = [];
+  const index = tris.map((v) => {
+    let n = remap.get(v);
+    if (n === undefined) {
+      n = order.length;
+      remap.set(v, n);
+      order.push(v);
+    }
+    return n;
+  });
+  const out = new THREE.BufferGeometry();
+  for (const [name, attr] of Object.entries(geo.attributes)) {
+    const src = attr as THREE.BufferAttribute;
+    const size = src.itemSize;
+    const Ctor = (src.array as unknown as { constructor: new (n: number) => THREE.TypedArray }).constructor;
+    const arr = new Ctor(order.length * size);
+    order.forEach((v, i) => {
+      for (let k = 0; k < size; k++) arr[i * size + k] = src.getComponent(v, k);
+    });
+    out.setAttribute(name, new THREE.BufferAttribute(arr, size, src.normalized));
+  }
+  out.setIndex(index);
+  out.computeBoundingSphere();
+  return out;
+}
+
 /** Restore a mesh's shape from before its first conformMeshToBody call. */
 export function resetConform(mesh: THREE.Mesh): void {
   const geo = mesh.geometry;
