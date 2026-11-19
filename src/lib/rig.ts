@@ -3,7 +3,7 @@ import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js"
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { MeshBVH } from "three-mesh-bvh";
 
-export type GarmentKind = "top" | "bottom" | "head" | "face" | "hair";
+export type GarmentKind = "top" | "bottom" | "head" | "face" | "hair" | "shoes";
 
 // Bone names vary wildly between rigs (Maya QuickRig "QuickRigCharacter2_LeftUpLeg",
 // Tripo "L_Thigh" / "L_ThighTwist01", Mixamo "mixamorig:LeftUpLeg", …), so bones
@@ -56,6 +56,10 @@ const BONE_SUBSETS: Record<GarmentKind, BoneRole[]> = {
   head: ["head"],
   face: ["head"],
   hair: ["head"],
+  // Shoes are narrowed further per shoe to ONE foot's chain (see footChains),
+  // so the left shoe never picks up weight from the right leg where the
+  // ankles nearly touch. The shin is included for boot shafts and collars.
+  shoes: ["foot", "toe", "lowerleg"],
 };
 
 // If a garment vertex ends up with no weight on allowed bones (e.g. a top
@@ -66,6 +70,7 @@ const ANCHOR_ROLE: Record<GarmentKind, BoneRole> = {
   head: "head",
   face: "head",
   hair: "head",
+  shoes: "foot",
 };
 
 export function allowedBoneIndices(skeleton: THREE.Skeleton, kind: GarmentKind): Set<number> {
@@ -140,6 +145,118 @@ function facing(byRole: Map<BoneRole, THREE.Vector3[]>): THREE.Vector3 {
   return new THREE.Vector3(0, 0, 1);
 }
 
+/**
+ * One chain per foot: the top-most foot bone (its parent is not itself a foot
+ * bone), every bone below it (toes, toe ends), and its shin when the parent is
+ * one. Built from the hierarchy rather than Left/Right in bone names, which
+ * every rig spells differently — a foot's children are always its own toes.
+ */
+export interface FootChain {
+  /** Index of the ankle (top-most foot) bone in the skeleton. */
+  root: number;
+  /** Bones a shoe on this foot may take weight from. */
+  bones: Set<number>;
+  /** Foot + toe bones only (no shin), for picking out foot skin. */
+  footBones: Set<number>;
+}
+
+export function footChains(skeleton: THREE.Skeleton): FootChain[] {
+  const bones = skeleton.bones;
+  const indexOf = new Map<THREE.Object3D, number>();
+  bones.forEach((b, i) => indexOf.set(b, i));
+  const chains: FootChain[] = [];
+  bones.forEach((bone, i) => {
+    if (boneRole(bone.name) !== "foot") return;
+    const parent = bone.parent;
+    if (parent && (parent as THREE.Bone).isBone && boneRole(parent.name) === "foot") return;
+    const footBones = new Set<number>();
+    bone.traverse((o) => {
+      const k = indexOf.get(o);
+      if (k !== undefined) footBones.add(k);
+    });
+    const chainBones = new Set(footBones);
+    const pi = parent ? indexOf.get(parent) : undefined;
+    if (pi !== undefined && boneRole(parent!.name) === "lowerleg") chainBones.add(pi);
+    chains.push({ root: i, bones: chainBones, footBones });
+  });
+  return chains;
+}
+
+/** Where one foot's skin sits in the world, for auto-fitting a shoe onto it. */
+export interface FootFrame {
+  chain: FootChain;
+  /** World-space midpoint of the foot, heel to toe and side to side, at sole height. */
+  center: THREE.Vector3;
+  /** World-space y of the lowest foot vertex. */
+  soleY: number;
+  /** Heel-to-toe extent along the facing direction. */
+  length: number;
+  /** Side-to-side extent. */
+  width: number;
+}
+
+/** The direction the avatar faces, horizontal, from its foot bones. */
+export function bodyFacing(bodyRoot: THREE.Object3D): THREE.Vector3 {
+  return facing(boneRoleMap(bodyRoot));
+}
+
+/**
+ * The plane splitting the avatar into left and right halves: through the hips,
+ * facing sideways. Reflecting across it maps one foot onto the other.
+ */
+export function sagittalPlane(bodyRoot: THREE.Object3D): THREE.Plane {
+  const byRole = boneRoleMap(bodyRoot);
+  const hips = byRole.get("hips") ?? byRole.get("spine");
+  if (!hips?.length) throw new Error("no hips bone found in body.glb");
+  const origin = hips.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(hips.length);
+  const side = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), facing(byRole)).normalize();
+  return new THREE.Plane().setFromNormalAndCoplanarPoint(side, origin);
+}
+
+/**
+ * Measure each foot from the skin it moves (body vertices weighted mostly to
+ * that foot's bones), in the body's current pose. Skin, not bones: ankle and
+ * toe joints sit inside the foot, and no rig has a bone at the heel.
+ */
+export function footFrames(body: THREE.SkinnedMesh, bodyRoot: THREE.Object3D): FootFrame[] {
+  const chains = footChains(body.skeleton);
+  if (chains.length === 0) throw new Error("no foot bones recognized in body.glb skeleton");
+  body.updateMatrixWorld(true);
+  const fwd = bodyFacing(bodyRoot);
+  const side = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), fwd).normalize();
+  const geo = body.geometry;
+  const skinIndex = geo.attributes.skinIndex as THREE.BufferAttribute;
+  const skinWeight = geo.attributes.skinWeight as THREE.BufferAttribute;
+  const p = new THREE.Vector3();
+  return chains.map((chain) => {
+    let minF = Infinity, maxF = -Infinity, minS = Infinity, maxS = -Infinity, minY = Infinity;
+    let count = 0;
+    for (let v = 0; v < geo.attributes.position.count; v++) {
+      let w = 0;
+      for (let c = 0; c < 4; c++) {
+        if (chain.footBones.has(skinIndex.getComponent(v, c))) w += skinWeight.getComponent(v, c);
+      }
+      if (w < 0.5) continue;
+      body.getVertexPosition(v, p);
+      p.applyMatrix4(body.matrixWorld);
+      const f = p.dot(fwd), sd = p.dot(side);
+      minF = Math.min(minF, f); maxF = Math.max(maxF, f);
+      minS = Math.min(minS, sd); maxS = Math.max(maxS, sd);
+      minY = Math.min(minY, p.y);
+      count++;
+    }
+    if (count === 0) {
+      // No skin weighted to this foot (unusual rig): fall back to the bone.
+      const at = body.skeleton.bones[chain.root].getWorldPosition(new THREE.Vector3());
+      return { chain, center: at, soleY: at.y, length: 0, width: 0 };
+    }
+    const center = fwd.clone().multiplyScalar((minF + maxF) / 2)
+      .addScaledVector(side, (minS + maxS) / 2);
+    center.y = minY;
+    return { chain, center, soleY: minY, length: maxF - minF, width: maxS - minS };
+  }).filter((f) => f.length > 0);
+}
+
 export interface FitFrame {
   /** World-space center of the region the garment should cover. */
   center: THREE.Vector3;
@@ -148,7 +265,8 @@ export interface FitFrame {
 }
 
 /** Region of the body a garment kind should cover, from bone world positions. */
-export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame {
+/** World positions of every recognized bone, grouped by role. */
+function boneRoleMap(bodyRoot: THREE.Object3D): Map<BoneRole, THREE.Vector3[]> {
   bodyRoot.updateMatrixWorld(true);
   const byRole = new Map<BoneRole, THREE.Vector3[]>();
   bodyRoot.traverse((o) => {
@@ -159,6 +277,11 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
     pts.push(o.getWorldPosition(new THREE.Vector3()));
     byRole.set(role, pts);
   });
+  return byRole;
+}
+
+export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame {
+  const byRole = boneRoleMap(bodyRoot);
 
   // Average position across all bones of a role; first role with any bones wins.
   const at = (...roles: BoneRole[]) => {
@@ -194,6 +317,13 @@ export function fitFrame(bodyRoot: THREE.Object3D, kind: GarmentKind): FitFrame 
   }
 
   const hips = at("hips");
+  if (kind === "shoes") {
+    // Only used for "as authored" placement (nudge range); auto-fit places
+    // each shoe from footFrames instead.
+    const foot = at("foot", "toe");
+    const shin = at("lowerleg", "upperleg");
+    return { center: foot, height: Math.abs(shin.y - foot.y) };
+  }
   if (kind === "bottom") {
     const foot = at("foot", "toe", "lowerleg");
     const height = Math.abs(hips.y - foot.y);
@@ -371,6 +501,53 @@ export function transferWeights(
     link(a, b); link(b, c); link(c, a);
   }
 
+  // Shoes: every connected piece of the mesh belongs to exactly ONE foot — the
+  // chain nearest to it — and may only take weight from that foot's bones.
+  // This is what lets each shoe follow its own foot. Deciding per piece rather
+  // than per mesh also handles a generated PAIR (two separate shoes in one
+  // mesh): each half binds to the foot it sits on.
+  let allowedOf = (_v: number) => allowed;
+  let anchorOf = (_v: number) => anchorIdx;
+  if (kind === "shoes") {
+    const chains = footChains(body.skeleton);
+    if (chains.length === 0) throw new Error("no foot bones recognized in body.glb skeleton");
+    // Chain bone positions in body-local space, where `geometry` lives.
+    const toLocal = new THREE.Matrix4().copy(body.matrixWorld).invert();
+    const chainPts = chains.map((ch) =>
+      [...ch.bones].map((b) => bones[b].getWorldPosition(new THREE.Vector3()).applyMatrix4(toLocal)),
+    );
+    const chainOfRep = new Int32Array(count).fill(-1);
+    const centroid = new THREE.Vector3();
+    for (let v = 0; v < count; v++) {
+      if (rep[v] !== v || chainOfRep[v] >= 0) continue;
+      // Flood one connected piece.
+      const piece: number[] = [v];
+      chainOfRep[v] = 0;
+      centroid.set(0, 0, 0);
+      for (let k = 0; k < piece.length; k++) {
+        const u = piece[k];
+        centroid.add(point.fromBufferAttribute(pos, u));
+        for (const nb of adj.get(u) ?? []) {
+          if (chainOfRep[nb] < 0) {
+            chainOfRep[nb] = 0;
+            piece.push(nb);
+          }
+        }
+      }
+      centroid.divideScalar(piece.length);
+      let best = 0, bestD = Infinity;
+      chainPts.forEach((pts, ci) => {
+        for (const q of pts) {
+          const d = q.distanceToSquared(centroid);
+          if (d < bestD) { bestD = d; best = ci; }
+        }
+      });
+      for (const u of piece) chainOfRep[u] = best;
+    }
+    allowedOf = (v) => chains[chainOfRep[rep[v]]].bones;
+    anchorOf = (v) => chains[chainOfRep[rep[v]]].root;
+  }
+
   // Per-representative weights: blend the skin weights of every body vertex
   // in range, kernel-weighted so influence fades smoothly at the radius edge.
   // The radius grows with distance from the body: a sleeve vert 8cm out that
@@ -389,7 +566,7 @@ export function transferWeights(
       for (let c = 0; c < 4; c++) {
         const bone = srcIndex.getComponent(id, c);
         const w = srcWeight.getComponent(id, c) * kern;
-        if (w > 0 && allowed.has(bone)) acc.set(bone, (acc.get(bone) ?? 0) + w);
+        if (w > 0 && allowedOf(v).has(bone)) acc.set(bone, (acc.get(bone) ?? 0) + w);
       }
     });
     let gathered = 0;
@@ -504,7 +681,7 @@ export function transferWeights(
         for (let c = 0; c < 4; c++) {
           const bone = srcIndex.getComponent(id, c);
           const w = srcWeight.getComponent(id, c) * baryW[k];
-          if (w > 0 && allowed.has(bone)) acc!.set(bone, (acc!.get(bone) ?? 0) + w);
+          if (w > 0 && allowedOf(v).has(bone)) acc!.set(bone, (acc!.get(bone) ?? 0) + w);
         }
       });
     }
@@ -512,7 +689,7 @@ export function transferWeights(
     let entries = [...acc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
     let total = entries.reduce((s, [, w]) => s + w, 0);
     if (total < 1e-6) {
-      entries = [[anchorIdx, 1]];
+      entries = [[anchorOf(v), 1]];
       total = 1;
     }
     entries.forEach(([bone, w], c) => {
@@ -964,18 +1141,36 @@ export function conformMeshToBody(
  * for parts bound to centre bones, since it does not swap Left/Right joints.
  */
 export function mirrorAcrossX(mesh: THREE.Mesh): THREE.Mesh {
+  return mirrorAcrossPlane(mesh, new THREE.Plane(new THREE.Vector3(1, 0, 0), 0));
+}
+
+/** World-space matrix reflecting points across `plane`. */
+export function reflectionMatrix(plane: THREE.Plane): THREE.Matrix4 {
+  const { x, y, z } = plane.normal;
+  const c = plane.constant;
+  // p' = p - 2 (n·p + c) n
+  return new THREE.Matrix4().set(
+    1 - 2 * x * x, -2 * x * y, -2 * x * z, -2 * c * x,
+    -2 * x * y, 1 - 2 * y * y, -2 * y * z, -2 * c * y,
+    -2 * x * z, -2 * y * z, 1 - 2 * z * z, -2 * c * z,
+    0, 0, 0, 1,
+  );
+}
+
+/**
+ * Copy of `mesh` reflected across a world-space plane, baked into world space
+ * with identity transform. Shoes use the body's own midline plane (see
+ * sagittalPlane) so a mirrored shoe lands on the other foot even when the
+ * avatar is not centred on x=0; transferWeights then binds it to that foot.
+ */
+export function mirrorAcrossPlane(mesh: THREE.Mesh, plane: THREE.Plane): THREE.Mesh {
   mesh.updateWorldMatrix(true, true);
   const geometry = mesh.geometry.clone();
   geometry.applyMatrix4(mesh.matrixWorld);
-
+  // applyMatrix4 carries normals through the (orthogonal) reflection too.
+  geometry.applyMatrix4(reflectionMatrix(plane));
   const pos = geometry.attributes.position as THREE.BufferAttribute;
-  for (let i = 0; i < pos.count; i++) pos.setX(i, -pos.getX(i));
-  pos.needsUpdate = true;
-  const nrm = geometry.attributes.normal as THREE.BufferAttribute | undefined;
-  if (nrm) {
-    for (let i = 0; i < nrm.count; i++) nrm.setX(i, -nrm.getX(i));
-    nrm.needsUpdate = true;
-  }
+
   // Reflection flips handedness, so triangles need rewinding to face outward.
   const index = geometry.index;
   if (index) {
@@ -1002,6 +1197,153 @@ export function mirrorAcrossX(mesh: THREE.Mesh): THREE.Mesh {
 
   const out = new THREE.Mesh(geometry, mesh.material);
   out.name = `${mesh.name || "garment"}_mirrored`;
+  return out;
+}
+
+/** One shoe cut out of a generated pair, in the pair's own (root-local) space. */
+export interface ShoePiece {
+  meshes: THREE.Mesh[];
+  /** Bounding-box centre and size of this shoe, root-local. */
+  center: THREE.Vector3;
+  size: THREE.Vector3;
+}
+
+/**
+ * Split a generated PAIR of shoes into its two shoes. Meshy often returns a
+ * pair as one mesh, sometimes with the shoes fused where they touch, so this
+ * does not rely on separate pieces: it looks along each horizontal axis of
+ * `root` for the emptiest slice in the middle of the model (the gap between
+ * the shoes) and cuts every triangle by which side of it the triangle's
+ * centre falls. A single shoe has no such gap along either axis, so null
+ * means "this is one shoe". Returned meshes are new (geometry compacted to
+ * the triangles kept) and positioned in `root`'s local space.
+ */
+export function splitShoePair(root: THREE.Object3D): { pieces: [ShoePiece, ShoePiece]; axis: "x" | "z" } | null {
+  root.updateWorldMatrix(true, true);
+  const toRoot = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  const sources = collectMeshes(root).map((m) => {
+    const geo = m.geometry.clone();
+    geo.applyMatrix4(new THREE.Matrix4().multiplyMatrices(toRoot, m.matrixWorld));
+    const material = Array.isArray(m.material) ? m.material[0] : m.material;
+    return { geo, material, name: m.name };
+  });
+  if (sources.length === 0) return null;
+
+  // Surface-area histogram along each horizontal axis: every triangle spreads
+  // its area over the slices it spans. Area rather than vertex counts, so a
+  // coarse grid-like mesh (vertices only on a few columns) cannot fake a gap.
+  const BINS = 64;
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const tri = new THREE.Triangle();
+  const forEachTri = (fn: (i0: number, i1: number, i2: number, geo: THREE.BufferGeometry) => void) => {
+    for (const { geo } of sources) {
+      const idx = geo.index;
+      const n = (idx ? idx.count : geo.attributes.position.count) / 3;
+      for (let t = 0; t < n; t++) {
+        fn(idx ? idx.getX(t * 3) : t * 3, idx ? idx.getX(t * 3 + 1) : t * 3 + 1, idx ? idx.getX(t * 3 + 2) : t * 3 + 2, geo);
+      }
+    }
+  };
+  let best: { axis: "x" | "z"; cut: number; score: number } | null = null;
+  for (const axis of ["x", "z"] as const) {
+    const get = (v: THREE.Vector3) => (axis === "x" ? v.x : v.z);
+    let lo = Infinity, hi = -Infinity;
+    for (const { geo } of sources) {
+      const pos = geo.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const v = axis === "x" ? pos.getX(i) : pos.getZ(i);
+        lo = Math.min(lo, v); hi = Math.max(hi, v);
+      }
+    }
+    if (hi - lo < 1e-9) continue;
+    const binOf = (v: number) => Math.min(BINS - 1, Math.max(0, Math.floor(((v - lo) / (hi - lo)) * BINS)));
+    const bins = new Array<number>(BINS).fill(0);
+    let total = 0, below = 0;
+    const centres: Array<[number, number]> = [];
+    forEachTri((i0, i1, i2, geo) => {
+      const pos = geo.attributes.position as THREE.BufferAttribute;
+      a.fromBufferAttribute(pos, i0); b.fromBufferAttribute(pos, i1); c.fromBufferAttribute(pos, i2);
+      const area = tri.set(a, b, c).getArea();
+      const b0 = binOf(Math.min(get(a), get(b), get(c)));
+      const b1 = binOf(Math.max(get(a), get(b), get(c)));
+      for (let k = b0; k <= b1; k++) bins[k] += area / (b1 - b0 + 1);
+      total += area;
+      centres.push([(get(a) + get(b) + get(c)) / 3, area]);
+    });
+    // Only the middle of the model can hold the gap between two shoes.
+    let minBin = -1;
+    for (let k = Math.floor(BINS * 0.25); k <= Math.ceil(BINS * 0.75); k++) {
+      if (minBin < 0 || bins[k] < bins[minBin]) minBin = k;
+    }
+    const sorted = bins.filter((n) => n > 0).sort((x, y) => x - y);
+    const median = sorted[sorted.length >> 1] || 1;
+    const score = bins[minBin] / median; // 0 = clean gap, ~1 = solid
+    const cut = lo + ((minBin + 0.5) / BINS) * (hi - lo);
+    for (const [centre, area] of centres) if (centre < cut) below += area;
+    const balanced = below > total * 0.2 && below < total * 0.8;
+    if (balanced && score < 0.1 && (!best || score < best.score)) best = { axis, cut, score };
+  }
+  if (!best) return null;
+
+  const sides: [THREE.Mesh[], THREE.Mesh[]] = [[], []];
+  for (const { geo, material, name } of sources) {
+    const pos = geo.attributes.position;
+    const idx = geo.index;
+    const triCount = (idx ? idx.count : pos.count) / 3;
+    const keep: [number[], number[]] = [[], []];
+    for (let t = 0; t < triCount; t++) {
+      const i0 = idx ? idx.getX(t * 3) : t * 3;
+      const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+      const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+      a.fromBufferAttribute(pos, i0); b.fromBufferAttribute(pos, i1); c.fromBufferAttribute(pos, i2);
+      const centre = best.axis === "x" ? (a.x + b.x + c.x) / 3 : (a.z + b.z + c.z) / 3;
+      keep[centre < best.cut ? 0 : 1].push(i0, i1, i2);
+    }
+    keep.forEach((tris, side) => {
+      if (tris.length === 0) return;
+      const mesh = new THREE.Mesh(compactGeometry(geo, tris), material);
+      mesh.name = `${name || "shoe"}_${side === 0 ? "a" : "b"}`;
+      sides[side].push(mesh);
+    });
+  }
+  if (!sides[0].length || !sides[1].length) return null;
+  const piece = (meshes: THREE.Mesh[]): ShoePiece => {
+    const box = new THREE.Box3();
+    for (const m of meshes) {
+      m.geometry.computeBoundingBox();
+      box.union(m.geometry.boundingBox!);
+    }
+    return { meshes, center: box.getCenter(new THREE.Vector3()), size: box.getSize(new THREE.Vector3()) };
+  };
+  return { pieces: [piece(sides[0]), piece(sides[1])], axis: best.axis };
+}
+
+/** New geometry holding only the given triangles (vertex indices into `geo`). */
+function compactGeometry(geo: THREE.BufferGeometry, tris: number[]): THREE.BufferGeometry {
+  const remap = new Map<number, number>();
+  const order: number[] = [];
+  const index = tris.map((v) => {
+    let n = remap.get(v);
+    if (n === undefined) {
+      n = order.length;
+      remap.set(v, n);
+      order.push(v);
+    }
+    return n;
+  });
+  const out = new THREE.BufferGeometry();
+  for (const [name, attr] of Object.entries(geo.attributes)) {
+    const src = attr as THREE.BufferAttribute;
+    const size = src.itemSize;
+    const Ctor = (src.array as unknown as { constructor: new (n: number) => THREE.TypedArray }).constructor;
+    const arr = new Ctor(order.length * size);
+    order.forEach((v, i) => {
+      for (let k = 0; k < size; k++) arr[i * size + k] = src.getComponent(v, k);
+    });
+    out.setAttribute(name, new THREE.BufferAttribute(arr, size, src.normalized));
+  }
+  out.setIndex(index);
+  out.computeBoundingSphere();
   return out;
 }
 

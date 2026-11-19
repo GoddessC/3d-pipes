@@ -8,6 +8,14 @@ import {
   conformMeshToBody,
   exportGlb,
   mirrorAcrossX,
+  mirrorAcrossPlane,
+  reflectionMatrix,
+  footFrames,
+  bodyFacing,
+  sagittalPlane,
+  type FootFrame,
+  splitShoePair,
+  type ShoePiece,
   findBodyMesh,
   fitFrame,
   loadGltf,
@@ -76,6 +84,22 @@ interface Bag {
   garmentGroup: THREE.Group | null;
   garmentSize: number;
   garmentCenter: THREE.Vector3;
+  /** Longest horizontal extent of the garment as loaded (a shoe's heel-to-toe). */
+  garmentLength: number;
+  /** Whether that longest extent runs along the garment's own x axis. */
+  garmentLongX: boolean;
+  /** Live mirrored copy of the garment, shown on the other foot while fitting shoes. */
+  mirrorGroup: THREE.Group | null;
+  /** Each foot measured in the rest pose; empty if the rig has no feet. */
+  feet: FootFrame[];
+  facing: THREE.Vector3;
+  midPlane: THREE.Plane | null;
+  /**
+   * The garment split into two shoes, when it is a generated pair (null if it
+   * is one shoe). Each group holds one shoe centred on its own origin, and is
+   * fitted to its own foot. Undefined until the first time shoes are chosen.
+   */
+  pair?: { groups: [THREE.Group, THREE.Group]; pieces: [ShoePiece, ShoePiece]; axis: "x" | "z" } | null;
   rigged: THREE.SkinnedMesh[];
   mixer: THREE.AnimationMixer | null;
   raf: number;
@@ -101,6 +125,8 @@ export function RigPanel({ garmentUrl }: Props) {
   const [tPose, setTPose] = useState(true);
   const [conformed, setConformed] = useState(false);
   const [mirror, setMirror] = useState(false);
+  // Shoes: the model holds a left+right pair, each fitted to its own foot.
+  const [pair, setPair] = useState(false);
   const [pose, setPose] = useState("");
   // "" when the garment has no untextured material to recolour.
   const [tint, setTint] = useState("");
@@ -184,17 +210,30 @@ export function RigPanel({ garmentUrl }: Props) {
         // Center the garment inside a group so fitting is scale + position only.
         let garmentGroup: THREE.Group | null = null;
         let garmentSize = 1;
+        let garmentLength = 1;
+        let garmentLongX = false;
+        let mirrorGroup: THREE.Group | null = null;
         const garmentCenter = new THREE.Vector3();
         if (garmentGltf) {
           const gScene = garmentGltf.scene;
           const gBox = new THREE.Box3().setFromObject(gScene);
           const gCenter = gBox.getCenter(new THREE.Vector3());
           garmentCenter.copy(gCenter);
-          garmentSize = Math.max(gBox.getSize(new THREE.Vector3()).y, 1e-6);
+          const gSize = gBox.getSize(new THREE.Vector3());
+          garmentSize = Math.max(gSize.y, 1e-6);
+          garmentLength = Math.max(gSize.x, gSize.z, 1e-6);
+          garmentLongX = gSize.x >= gSize.z;
           gScene.position.sub(gCenter);
           garmentGroup = new THREE.Group();
           garmentGroup.add(gScene);
           scene.add(garmentGroup);
+          // Shares geometry and materials, so conforming or recolouring the
+          // fitted shoe shows on its mirror twin too. Its matrix is set by hand
+          // (a reflection of the fitted group's), so auto-update is off.
+          mirrorGroup = garmentGroup.clone(true);
+          mirrorGroup.matrixAutoUpdate = false;
+          mirrorGroup.visible = false;
+          scene.add(mirrorGroup);
           const tints = tintableMaterials(garmentGroup);
           setTint(tints.length ? `#${tints[0].color.getHexString()}` : "");
         }
@@ -211,6 +250,12 @@ export function RigPanel({ garmentUrl }: Props) {
           garmentGroup,
           garmentSize,
           garmentCenter,
+          garmentLength,
+          garmentLongX,
+          mirrorGroup,
+          feet: [],
+          facing: new THREE.Vector3(0, 0, 1),
+          midPlane: null,
           rigged: [],
           mixer: null,
           raf: 0,
@@ -276,6 +321,19 @@ export function RigPanel({ garmentUrl }: Props) {
     if (!bag?.garmentGroup || phase !== "fitting") return;
     try {
       const frame = fitFrame(bag.bodyRoot, kind);
+      const usePair = kind === "shoes" && pair && !!bag.pair;
+      bag.garmentGroup.visible = !usePair;
+      bag.pair?.groups.forEach((g) => (g.visible = usePair));
+      if (usePair) {
+        if (bag.mirrorGroup) bag.mirrorGroup.visible = false;
+        fitPair(bag);
+        return;
+      }
+      if (kind === "shoes" && fitMode === "auto") {
+        fitShoe(bag);
+        return;
+      }
+      if (bag.mirrorGroup) bag.mirrorGroup.visible = false;
       // "authored" keeps the file's own placement (for assets built in body
       // space); "auto" scales/centers the garment onto the body region.
       const anchor = fitMode === "authored" ? bag.garmentCenter : frame.center;
@@ -296,7 +354,7 @@ export function RigPanel({ garmentUrl }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [phase, kind, fitMode, lengthMult, widthMult, depthMult, offX, offY, offZ, rotY, pose, tPose, armDeg]);
+  }, [phase, kind, fitMode, lengthMult, widthMult, depthMult, offX, offY, offZ, rotY, pose, tPose, armDeg, mirror, pair]);
 
   // Dispose the renderer on unmount.
   useEffect(
@@ -310,6 +368,119 @@ export function RigPanel({ garmentUrl }: Props) {
     },
     [],
   );
+
+  /** Measure the feet once (rest pose), the first time shoes are fitted. */
+  function ensureFeet(bag: Bag) {
+    if (bag.midPlane) return;
+    bag.facing = bodyFacing(bag.bodyRoot);
+    bag.midPlane = sagittalPlane(bag.bodyRoot);
+    bag.feet = footFrames(bag.bodyMesh, bag.bodyRoot);
+    if (bag.feet.length === 0) throw new Error("could not measure the avatar's feet");
+  }
+
+  /**
+   * Stand the shoe on one foot: heel-to-toe scaled to the foot's length, long
+   * axis turned along the way the avatar faces, sole on the floor. The mirror
+   * twin is the same placement reflected across the body's midline, so it
+   * lands on the other foot.
+   */
+  function fitShoe(bag: Bag) {
+    const group = bag.garmentGroup!;
+    ensureFeet(bag);
+    // Fit onto the foot on the negative side of the midline; the twin takes the other.
+    const foot = [...bag.feet].sort(
+      (a, b) => bag.midPlane!.distanceToPoint(a.center) - bag.midPlane!.distanceToPoint(b.center),
+    )[0];
+    // A little longer than the bare foot, for the sole and toe box.
+    const base = (foot.length * 1.08) / bag.garmentLength;
+    group.scale.set(base * widthMult, base * lengthMult, base * depthMult);
+    const f = bag.facing;
+    const autoYaw = bag.garmentLongX ? Math.atan2(-f.z, f.x) : Math.atan2(f.x, f.z);
+    group.rotation.set(0, autoYaw + (rotY * Math.PI) / 180, 0);
+    const nudge = foot.length * 0.6;
+    const halfHeight = (bag.garmentSize * base * lengthMult) / 2;
+    group.position.set(
+      foot.center.x + offX * nudge,
+      foot.soleY + halfHeight + offY * nudge,
+      foot.center.z + offZ * nudge,
+    );
+    group.updateMatrix();
+    if (bag.mirrorGroup) {
+      bag.mirrorGroup.visible = mirror;
+      bag.mirrorGroup.matrix.multiplyMatrices(reflectionMatrix(bag.midPlane!), group.matrix);
+      bag.mirrorGroup.matrixWorldNeedsUpdate = true;
+    }
+  }
+
+  /**
+   * Look once for a pair in the garment and, if found, cut it into two shoe
+   * groups (hidden until pair mode is on). Returns whether it is a pair.
+   */
+  function ensurePair(bag: Bag): boolean {
+    if (bag.pair === undefined) {
+      bag.pair = null;
+      const split = bag.garmentGroup ? splitShoePair(bag.garmentGroup) : null;
+      if (split) {
+        const groups = split.pieces.map((piece) => {
+          const inner = new THREE.Group();
+          inner.position.copy(piece.center).negate();
+          piece.meshes.forEach((m) => inner.add(m));
+          const outer = new THREE.Group();
+          outer.add(inner);
+          outer.visible = false;
+          bag.scene.add(outer);
+          return outer;
+        }) as [THREE.Group, THREE.Group];
+        bag.pair = { groups, pieces: split.pieces, axis: split.axis };
+      }
+    }
+    return !!bag.pair;
+  }
+
+  /** What is being fitted right now: the two shoes of a pair, or the whole garment. */
+  function fitTargets(bag: Bag): THREE.Object3D[] {
+    if (kind === "shoes" && pair && bag.pair) return bag.pair.groups;
+    return bag.garmentGroup ? [bag.garmentGroup] : [];
+  }
+
+  /**
+   * Fit a generated pair: both shoes keep their own shape and side, turn
+   * together (so "rotate" 180 swaps which shoe is on which foot, as it would
+   * in real life), share one scale, and each is stood on its own foot.
+   */
+  function fitPair(bag: Bag) {
+    ensureFeet(bag);
+    const { groups, pieces, axis } = bag.pair!;
+    const plane = bag.midPlane!;
+    const f = bag.facing;
+    // The shoes sit side by side along the cut axis, so heel-to-toe is the other one.
+    const autoYaw = axis === "x" ? Math.atan2(f.x, f.z) : Math.atan2(-f.z, f.x);
+    const yaw = autoYaw + (rotY * Math.PI) / 180;
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+    const lengthOf = (p: ShoePiece) => (axis === "x" ? p.size.z : p.size.x);
+    const shoeLen = (lengthOf(pieces[0]) + lengthOf(pieces[1])) / 2;
+    const footLen = bag.feet.reduce((s, ft) => s + ft.length, 0) / bag.feet.length;
+    const base = (footLen * 1.08) / Math.max(shoeLen, 1e-6);
+    // Which shoe is which: the one on the negative side of the body's midline
+    // once the pair is turned goes on the foot on that side.
+    const mid = pieces[0].center.clone().add(pieces[1].center).multiplyScalar(0.5);
+    const sideOf = (p: ShoePiece) => p.center.clone().sub(mid).applyQuaternion(q).dot(plane.normal);
+    const feet = [...bag.feet].sort((a, b) => plane.distanceToPoint(a.center) - plane.distanceToPoint(b.center));
+    const order = sideOf(pieces[0]) <= sideOf(pieces[1]) ? [0, 1] : [1, 0];
+    order.forEach((pi, k) => {
+      const foot = feet[k === 0 ? 0 : feet.length - 1];
+      const group = groups[pi];
+      const nudge = foot.length * 0.6;
+      // "side" spreads the shoes apart or together, symmetric about the midline.
+      const out = Math.sign(plane.distanceToPoint(foot.center)) || 1;
+      group.scale.set(base * widthMult, base * lengthMult, base * depthMult);
+      group.quaternion.copy(q);
+      group.position.copy(foot.center)
+        .addScaledVector(plane.normal, out * offX * nudge)
+        .addScaledVector(f, offZ * nudge);
+      group.position.y = foot.soleY + (pieces[pi].size.y * base * lengthMult) / 2 + offY * nudge;
+    });
+  }
 
   /** Stop any clip and return the skeleton to its bind pose. */
   function stopPose(bag: Bag) {
@@ -337,14 +508,22 @@ export function RigPanel({ garmentUrl }: Props) {
     setPose("");
     restPose(bag);
     try {
-      const meshes = collectMeshes(bag.garmentGroup);
+      const meshes = fitTargets(bag).flatMap((t) => collectMeshes(t));
       if (meshes.length === 0) throw new Error("garment has no meshes");
       // Mirroring is only safe for centre-bone parts (it doesn't swap L/R joints).
-      const toBind = mirror && CENTRE_BOUND.has(kind)
-        ? meshes.flatMap((m) => [m, mirrorAcrossX(m)])
-        : meshes;
+      let toBind = meshes;
+      if (mirror && CENTRE_BOUND.has(kind)) {
+        toBind = meshes.flatMap((m) => [m, mirrorAcrossX(m)]);
+      } else if (mirror && kind === "shoes" && !(pair && bag.pair)) {
+        // The twin is reflected across the body's own midline onto the other
+        // foot; binding then ties each shoe to whichever foot it sits on.
+        ensureFeet(bag);
+        toBind = meshes.flatMap((m) => [m, mirrorAcrossPlane(m, bag.midPlane!)]);
+      }
       bag.rigged = toBind.map((m) => bindGarment(m, bag.bodyMesh, kind));
       bag.scene.remove(bag.garmentGroup);
+      if (bag.mirrorGroup) bag.scene.remove(bag.mirrorGroup);
+      bag.pair?.groups.forEach((g) => bag.scene.remove(g));
       setPhase("bound");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -360,8 +539,11 @@ export function RigPanel({ garmentUrl }: Props) {
     try {
       const clearance = 0.008 * bag.bodyHeight;
       const influence = clearance + 0.08 * bag.bodyHeight;
-      collectMeshes(bag.garmentGroup).forEach((m) =>
-        conformMeshToBody(m, bag.bodyMesh, clearance, influence, 0.8),
+      // Shoes only push out where the foot pokes through: pulling them in
+      // toward the skin, as clothes are, would melt the sole and toe box.
+      const strength = kind === "shoes" ? 0 : 0.8;
+      fitTargets(bag).flatMap((t) => collectMeshes(t)).forEach((m) =>
+        conformMeshToBody(m, bag.bodyMesh, clearance, influence, strength),
       );
       setConformed(true);
     } catch (err) {
@@ -372,7 +554,7 @@ export function RigPanel({ garmentUrl }: Props) {
   function resetShape() {
     const bag = bagRef.current;
     if (!bag?.garmentGroup) return;
-    collectMeshes(bag.garmentGroup).forEach(resetConform);
+    fitTargets(bag).flatMap((t) => collectMeshes(t)).forEach(resetConform);
     setConformed(false);
   }
 
@@ -384,6 +566,8 @@ export function RigPanel({ garmentUrl }: Props) {
     bag.rigged.forEach((m) => m.parent?.remove(m));
     bag.rigged = [];
     bag.scene.add(bag.garmentGroup);
+    if (bag.mirrorGroup) bag.scene.add(bag.mirrorGroup);
+    bag.pair?.groups.forEach((g) => bag.scene.add(g));
     setPhase("fitting");
   }
 
@@ -496,19 +680,40 @@ export function RigPanel({ garmentUrl }: Props) {
           <select
             value={kind}
             disabled={phase === "bound"}
-            onChange={(e) => setKind(e.target.value as GarmentKind)}
+            onChange={(e) => {
+              const next = e.target.value as GarmentKind;
+              setKind(next);
+              // A generated pair is fitted shoe by shoe; one shoe is mirrored.
+              const bag = bagRef.current;
+              if (next === "shoes" && bag) {
+                try {
+                  const isPair = ensurePair(bag);
+                  setPair(isPair);
+                  setMirror(!isPair);
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : String(err));
+                }
+              }
+            }}
           >
             <option value="top">top (upper body)</option>
             <option value="bottom">bottom (lower body)</option>
             <option value="head">head (hat)</option>
             <option value="hair">hair</option>
             <option value="face">face (eyes/brows)</option>
+            <option value="shoes">shoes</option>
           </select>
         </label>
-        {CENTRE_BOUND.has(kind) && phase === "fitting" && (
+        {kind === "shoes" && phase === "fitting" && bagRef.current?.pair && (
+          <label>
+            <input type="checkbox" checked={pair} onChange={(e) => setPair(e.target.checked)} />
+            pair (left + right)
+          </label>
+        )}
+        {(CENTRE_BOUND.has(kind) || (kind === "shoes" && !pair)) && phase === "fitting" && (
           <label>
             <input type="checkbox" checked={mirror} onChange={(e) => setMirror(e.target.checked)} />
-            mirror
+            {kind === "shoes" ? "mirror to other foot" : "mirror"}
           </label>
         )}
         {tint && (
